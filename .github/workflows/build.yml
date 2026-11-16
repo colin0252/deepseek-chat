@@ -23,14 +23,14 @@ jobs:
             -target DeepSeekChat \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build \
+            SYMROOT="$PWD/build" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/DeepSeekChat.app Payload/
+          cp -R build/Release-iphoneos/DeepSeekChat.app Payload/
           zip -r DeepSeekChat-unsigned.ipa Payload
           ls -lh DeepSeekChat-unsigned.ipa
 
