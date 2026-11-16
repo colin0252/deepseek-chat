@@ -63,9 +63,7 @@ struct ModelsResponse: Decodable { let data: [ModelInfo] }
 // MARK: - 文件类型识别
 enum FileClassifier {
     static func make(from url: URL) -> PickedFile? {
-        let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = readData(url) else { return nil }
         let name = url.lastPathComponent
         let ext = url.pathExtension.lowercased()
         var purpose = "user_data"
@@ -93,6 +91,21 @@ enum FileClassifier {
         }
         return PickedFile(data: data, filename: name, isImage: isImage,
                           purpose: purpose, mimeType: mime, isZip: isZip)
+    }
+
+    static func readData(_ url: URL) -> Data? {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        var result: Data? = nil
+        var coordError: NSError? = nil
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
+            result = try? Data(contentsOf: newURL, options: .mappedIfSafe)
+            if result == nil { result = try? Data(contentsOf: newURL) }
+        }
+        if result == nil { result = try? Data(contentsOf: url, options: .mappedIfSafe) }
+        if result == nil { result = try? Data(contentsOf: url) }
+        return result
     }
 
     static func image(from data: Data) -> PickedFile? {
@@ -864,14 +877,16 @@ struct ContentView: View {
                     }
                 }
             }
-            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
                 switch result {
                 case .success(let urls):
                     var arr: [PickedFile] = []
+                    var failed: [String] = []
                     for url in urls {
-                        if let pf = FileClassifier.make(from: url) { arr.append(pf) }
+                        if let pf = FileClassifier.make(from: url) { arr.append(pf) } else { failed.append(url.lastPathComponent) }
                     }
-                    picked.append(contentsOf: arr)
+                    if !arr.isEmpty { picked.append(contentsOf: arr) }
+                    if !failed.isEmpty { store.errorText = "无法读取文件：" + failed.joined(separator: "、") }
                 case .failure(let e):
                     store.errorText = "选取文件失败：\(e.localizedDescription)"
                 }
@@ -903,24 +918,37 @@ struct ConversationListView: View {
                 }
                 Section(header: Text("历史对话")) {
                     ForEach(store.conversations) { conv in
-                        Button {
-                            store.select(conv.id)
-                            dismiss()
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(conv.title).font(.body).lineLimit(1)
-                                    Text("\(conv.messages.count) 条消息")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                if conv.id == store.currentID {
-                                    Image(systemName: "checkmark").foregroundColor(.accentColor)
-                                }
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(conv.title).font(.body).lineLimit(1)
+                                Text("\(conv.messages.count) 条消息")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if conv.id == store.currentID {
+                                Image(systemName: "checkmark").foregroundColor(.accentColor)
                             }
                         }
-                        .foregroundColor(.primary)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            store.select(conv.id)
+                            dismiss()
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                store.delete(conv.id)
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                store.delete(conv.id)
+                            } label: {
+                                Label("删除对话", systemImage: "trash")
+                            }
+                        }
                     }
                     .onDelete { idx in
                         let ids = idx.map { store.conversations[$0].id }
@@ -931,6 +959,9 @@ struct ConversationListView: View {
             .navigationTitle("对话")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    EditButton()
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("完成") { dismiss() }
                 }
