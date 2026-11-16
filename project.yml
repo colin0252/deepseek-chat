@@ -1,0 +1,29 @@
+name: DeepSeekChat
+options:
+  bundleIdPrefix: com.colin
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+targets:
+  DeepSeekChat:
+    type: application
+    platform: iOS
+    sources:
+      - path: DeepSeekChat
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.colin.deepseekchat
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+    info:
+      path: DeepSeekChat/Info.plist
+      properties:
+        CFBundleDisplayName: 我的DeepSeek
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
