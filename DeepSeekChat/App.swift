@@ -3,14 +3,24 @@ import Foundation
 import Security
 import PhotosUI
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - 数据模型
+struct Attachment {
+    var data: Data
+    var filename: String
+    var purpose: String      // user_data / text_recognition / rich_layout_recognition
+    var isImage: Bool
+    var mimeType: String
+    var fileId: String?      // 上传成功后填入
+}
+
 struct ChatMessage: Identifiable {
     enum Role: String { case user, assistant }
     let id = UUID()
     var role: Role
     var content: String
-    var imageBase64: String?
+    var attachment: Attachment?
 }
 
 struct ChatRequestError: Error { let message: String }
@@ -29,10 +39,54 @@ struct ModelInfo: Identifiable, Decodable {
         if let n = name, !n.isEmpty { return n }
         return id
     }
-    var supportsImage: Bool { (input_modalities ?? []).contains("image") }
 }
 
 struct ModelsResponse: Decodable { let data: [ModelInfo] }
+
+// MARK: - 文件类型 → purpose / mime
+enum FileClassifier {
+    static func make(from url: URL) -> Attachment? {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let name = url.lastPathComponent
+        let ext = url.pathExtension.lowercased()
+        var purpose = "user_data"
+        var isImage = false
+        var mime = "application/octet-stream"
+        switch ext {
+        case "jpg", "jpeg": isImage = true; mime = "image/jpeg"
+        case "png": isImage = true; mime = "image/png"
+        case "gif": isImage = true; mime = "image/gif"
+        case "webp": isImage = true; mime = "image/webp"
+        case "pdf": purpose = "text_recognition"; mime = "application/pdf"
+        case "doc": purpose = "text_recognition"; mime = "application/msword"
+        case "docx": purpose = "text_recognition"; mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        case "ppt": purpose = "text_recognition"; mime = "application/vnd.ms-powerpoint"
+        case "pptx": purpose = "text_recognition"; mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        case "xlsx": mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        case "xls": mime = "application/vnd.ms-excel"
+        case "epub": mime = "application/epub+zip"
+        case "txt", "md", "csv", "json", "xml", "html", "swift", "py", "js", "ts", "c", "cpp", "java":
+            mime = "text/plain"
+        default:
+            mime = "application/octet-stream"
+        }
+        return Attachment(data: data, filename: name, purpose: purpose,
+                          isImage: isImage, mimeType: mime, fileId: nil)
+    }
+
+    static func image(from data: Data) -> Attachment? {
+        let jpeg: Data
+        if let ui = UIImage(data: data), let j = ui.jpegData(compressionQuality: 0.85) {
+            jpeg = j
+        } else {
+            jpeg = data
+        }
+        return Attachment(data: jpeg, filename: "photo.jpg", purpose: "user_data",
+                          isImage: true, mimeType: "image/jpeg", fileId: nil)
+    }
+}
 
 // MARK: - 钥匙串（安全保存 API Key）
 enum Keychain {
@@ -67,7 +121,7 @@ enum Keychain {
     }
 }
 
-// MARK: - DeepSeek 网络客户端（流式 + 联网搜索 + 图片）
+// MARK: - DeepSeek 网络客户端（上传文件 + 流式对话 + 联网搜索）
 final class DeepSeekClient {
     let apiBase: String
     let apiKey: String
@@ -80,19 +134,54 @@ final class DeepSeekClient {
         self.webSearch = webSearch
     }
 
-    private func cleanedBase() -> String {
+    func cleanedBase() -> String {
         apiBase.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
+    // 上传文件到 Files API，返回 file_id
+    func uploadFile(_ att: Attachment) async throws -> String {
+        guard let url = URL(string: cleanedBase() + "/files") else {
+            throw ChatRequestError(message: "API 地址无效")
+        }
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var body = Data()
+        func app(_ s: String) { if let d = s.data(using: .utf8) { body.append(d) } }
+        app("--\(boundary)\r\n")
+        app("Content-Disposition: form-data; name=\"purpose\"\r\n\r\n")
+        app("\(att.purpose)\r\n")
+        app("--\(boundary)\r\n")
+        app("Content-Disposition: form-data; name=\"file\"; filename=\"\(att.filename)\"\r\n")
+        app("Content-Type: \(att.mimeType)\r\n\r\n")
+        body.append(att.data)
+        app("\r\n--\(boundary)--\r\n")
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        let (data, resp) = try await URLSession.shared.upload(for: req, from: body)
+        guard let http = resp as? HTTPURLResponse else {
+            throw ChatRequestError(message: "上传无响应")
+        }
+        if http.statusCode != 200 {
+            let t = String(data: data, encoding: .utf8) ?? ""
+            throw ChatRequestError(message: "上传失败 HTTP \(http.statusCode)\n\(t)")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = obj["id"] as? String else {
+            throw ChatRequestError(message: "上传返回异常")
+        }
+        return id
+    }
+
     private func encodeMessages(_ msgs: [ChatMessage]) -> [[String: Any]] {
         msgs.map { m in
-            if let b64 = m.imageBase64, !b64.isEmpty {
-                let content: [[String: Any]] = [
-                    ["type": "text", "text": m.content],
-                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]]
-                ]
-                return ["role": m.role.rawValue, "content": content]
+            if let att = m.attachment, let fid = att.fileId {
+                var blocks: [[String: Any]] = []
+                if !m.content.isEmpty { blocks.append(["type": "text", "text": m.content]) }
+                blocks.append(["type": "file", "file_id": fid])
+                return ["role": m.role.rawValue, "content": blocks]
             } else {
                 return ["role": m.role.rawValue, "content": m.content]
             }
@@ -199,9 +288,6 @@ final class ChatStore: ObservableObject {
         apiKey = Keychain.read("apiKey")
     }
 
-    var currentModelSupportsImage: Bool {
-        models.first(where: { $0.id == selectedModel })?.supportsImage ?? false
-    }
     var currentModelDisplay: String {
         models.first(where: { $0.id == selectedModel })?.display ?? selectedModel
     }
@@ -253,28 +339,44 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    func send(_ text: String, image: Data?) async {
+    func send(_ text: String, attachment: Attachment?) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || image != nil else { return }
+        guard !trimmed.isEmpty || attachment != nil else { return }
         guard !isSending else { return }
         guard !apiKey.isEmpty else {
             errorText = "请先在设置里填写 API Key"
             return
         }
-        if image != nil && !currentModelSupportsImage {
-            errorText = "当前模型（\(currentModelDisplay)）不支持图片，请换一个支持图片的模型"
-            return
-        }
         errorText = nil
         statusText = nil
-        let b64 = image?.base64EncodedString()
-        messages.append(ChatMessage(role: .user, content: trimmed, imageBase64: b64))
-        let assistantIndex = messages.count
-        messages.append(ChatMessage(role: .assistant, content: "", imageBase64: nil))
         isSending = true
 
+        // 1) 若有附件，先上传拿 file_id
+        var att = attachment
+        let needsFile = att != nil
+        if var a = att {
+            statusText = "正在上传文件…"
+            let uploader = DeepSeekClient(apiBase: apiBase, apiKey: apiKey, model: selectedModel, webSearch: false)
+            do {
+                let fid = try await uploader.uploadFile(a)
+                a.fileId = fid
+                att = a
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                errorText = "文件上传失败：\(msg)"
+                statusText = nil
+                isSending = false
+                return
+            }
+        }
+        statusText = nil
+
+        messages.append(ChatMessage(role: .user, content: trimmed, attachment: att))
+        let assistantIndex = messages.count
+        messages.append(ChatMessage(role: .assistant, content: "", attachment: nil))
+
         let convo = Array(messages.prefix(assistantIndex))
-        let effectiveModel = webSearch ? "deepseek-flash" : selectedModel
+        let effectiveModel = (needsFile || webSearch) ? "deepseek-flash" : selectedModel
         let client = DeepSeekClient(apiBase: apiBase, apiKey: apiKey, model: effectiveModel, webSearch: webSearch)
         do {
             for try await ev in client.stream(messages: convo) {
@@ -300,6 +402,26 @@ final class ChatStore: ObservableObject {
     }
 }
 
+// MARK: - 附件小视图
+struct AttachmentChip: View {
+    let att: Attachment
+    var body: some View {
+        if att.isImage, let ui = UIImage(data: att.data) {
+            Image(uiImage: ui)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 180)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        } else {
+            Label(att.filename, systemImage: "doc.fill")
+                .font(.caption)
+                .padding(8)
+                .background(Color(UIColor.tertiarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+}
+
 // MARK: - 单条消息
 struct MessageRow: View {
     let message: ChatMessage
@@ -307,12 +429,8 @@ struct MessageRow: View {
         HStack {
             if message.role == .user { Spacer(minLength: 40) }
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
-                if let b64 = message.imageBase64, let d = Data(base64Encoded: b64), let ui = UIImage(data: d) {
-                    Image(uiImage: ui)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: 180)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                if let att = message.attachment {
+                    AttachmentChip(att: att)
                 }
                 if !message.content.isEmpty {
                     Text(message.content)
@@ -322,7 +440,7 @@ struct MessageRow: View {
                                     : Color(UIColor.secondarySystemBackground))
                         .clipShape(RoundedRectangle(cornerRadius: 14))
                         .textSelection(.enabled)
-                } else if message.imageBase64 == nil {
+                } else if message.attachment == nil {
                     Text("…")
                         .padding(10)
                         .background(Color(UIColor.secondarySystemBackground))
@@ -339,8 +457,10 @@ struct ContentView: View {
     @StateObject private var store = ChatStore()
     @State private var input = ""
     @State private var showSettings = false
-    @State private var pickedImage: Data?
+    @State private var picked: Attachment?
     @State private var photoItem: PhotosPickerItem?
+    @State private var showPhotos = false
+    @State private var showFiles = false
 
     var body: some View {
         NavigationView {
@@ -376,11 +496,15 @@ struct ContentView: View {
                         .padding(.top, 4)
                 }
                 Divider()
-                if let img = pickedImage, let ui = UIImage(data: img) {
+                if let p = picked {
                     HStack {
-                        Image(uiImage: ui).resizable().scaledToFit().frame(height: 60).clipShape(RoundedRectangle(cornerRadius: 8))
+                        if p.isImage, let ui = UIImage(data: p.data) {
+                            Image(uiImage: ui).resizable().scaledToFit().frame(height: 60).clipShape(RoundedRectangle(cornerRadius: 8))
+                        } else {
+                            Label(p.filename, systemImage: "doc.fill").font(.caption)
+                        }
                         Button {
-                            pickedImage = nil
+                            picked = nil
                             photoItem = nil
                         } label: {
                             Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
@@ -391,23 +515,12 @@ struct ContentView: View {
                     .padding(.top, 6)
                 }
                 HStack(alignment: .bottom, spacing: 8) {
-                    PhotosPicker(selection: $photoItem, matching: .images) {
-                        Image(systemName: "photo.on.rectangle")
+                    Menu {
+                        Button { showPhotos = true } label: { Label("照片", systemImage: "photo") }
+                        Button { showFiles = true } label: { Label("文件（PDF/Word/PPT/Excel/txt…）", systemImage: "folder") }
+                    } label: {
+                        Image(systemName: "paperclip")
                             .font(.system(size: 20))
-                    }
-                    .onChange(of: photoItem) { newItem in
-                        guard let newItem = newItem else { return }
-                        Task {
-                            if let data = try? await newItem.loadTransferable(type: Data.self) {
-                                let jpeg: Data
-                                if let ui = UIImage(data: data), let j = ui.jpegData(compressionQuality: 0.8) {
-                                    jpeg = j
-                                } else {
-                                    jpeg = data
-                                }
-                                await MainActor.run { pickedImage = jpeg }
-                            }
-                        }
                     }
                     TextField("输入消息…", text: $input, axis: .vertical)
                         .lineLimit(1...5)
@@ -416,17 +529,17 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     Button {
                         let t = input
-                        let img = pickedImage
+                        let img = picked
                         input = ""
-                        pickedImage = nil
+                        picked = nil
                         photoItem = nil
-                        Task { await store.send(t, image: img) }
+                        Task { await store.send(t, attachment: img) }
                     } label: {
                         Image(systemName: "paperplane.fill")
                             .font(.system(size: 18))
                             .padding(8)
                     }
-                    .disabled(store.isSending || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pickedImage == nil))
+                    .disabled(store.isSending || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && picked == nil))
                 }
                 .padding(10)
             }
@@ -447,6 +560,26 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(store: store)
+            }
+            .photosPicker(isPresented: $showPhotos, selection: $photoItem, matching: .images)
+            .onChange(of: photoItem) { newItem in
+                guard let newItem = newItem else { return }
+                Task {
+                    if let data = try? await newItem.loadTransferable(type: Data.self),
+                       let made = FileClassifier.image(from: data) {
+                        await MainActor.run { picked = made }
+                    }
+                }
+            }
+            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first, let made = FileClassifier.make(from: url) {
+                        picked = made
+                    }
+                case .failure(let e):
+                    store.errorText = "选取文件失败：\(e.localizedDescription)"
+                }
             }
             .task { await store.loadModels() }
         }
@@ -502,6 +635,11 @@ struct SettingsView: View {
                 Section(header: Text("联网搜索")) {
                     Toggle("开启联网搜索", isOn: $webSearch)
                     Text("开启后使用 deepseek-flash 模型联网检索并给出引用。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Section(header: Text("文件上传说明")) {
+                    Text("发送文件或图片时会自动改用 deepseek-flash 模型（官方文件解析只支持该模型）。支持 PDF/Word/PPT/Excel/txt/图片等。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
