@@ -955,7 +955,7 @@ final class ChatStore: ObservableObject {
         if providers[0].apis.isEmpty {
             let old = Keychain.read("apiKey")
             if !old.isEmpty {
-                var cfg = APIConfig(nickname: "默认", key: old)
+                let cfg = APIConfig(nickname: "默认", key: old)
                 providers[0].apis.append(cfg)
                 Keychain.save(old, for: "api_\(cfg.id.uuidString)")
                 persistProviders()
@@ -1366,6 +1366,40 @@ struct ActivityView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+// MARK: - 原生文件选择（asCopy：先复制到本机，比 fileImporter 稳）
+struct DocumentPicker: UIViewControllerRepresentable {
+    var allowsMultiple: Bool = true
+    var contentTypes: [UTType] = [.data]
+    var onPick: ([URL]) -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let vc = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        vc.allowsMultipleSelection = allowsMultiple
+        vc.delegate = context.coordinator
+        return vc
+    }
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+        init(onPick: @escaping ([URL]) -> Void) { self.onPick = onPick }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onPick([]) }
+    }
+}
+
+// 主界面弹窗枚举（单一 sheet，避免多个弹窗互相干扰）
+enum ActiveSheet: Identifiable {
+    case settings, convList, ai, export, files
+    var id: Int { switch self { case .settings: return 0; case .convList: return 1; case .ai: return 2; case .export: return 3; case .files: return 4 } }
+}
+
+enum ConvSheet: Identifiable {
+    case importFile, export
+    var id: Int { switch self { case .importFile: return 0; case .export: return 1 } }
+}
+
 // MARK: - 附件预览
 struct AttachmentChip: View {
     let att: MessageAttachment
@@ -1412,15 +1446,11 @@ struct MessageRow: View {
 struct ContentView: View {
     @StateObject private var store = ChatStore()
     @State private var input = ""
-    @State private var showSettings = false
-    @State private var showConvList = false
-    @State private var showAI = false
+    @State private var activeSheet: ActiveSheet?
     @State private var picked: [PickedFile] = []
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var showPhotos = false
-    @State private var showFiles = false
     @State private var exportItems: [Any] = []
-    @State private var showExport = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -1451,7 +1481,7 @@ struct ContentView: View {
                 Divider()
 
                 // 选择当前 AI（每个对话独立）
-                Button { showAI = true } label: {
+                Button { activeSheet = .ai } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "cpu")
                         Text(store.selectionSummary).font(.footnote).lineLimit(1)
@@ -1466,7 +1496,7 @@ struct ContentView: View {
                 // 附件区
                 HStack(spacing: 10) {
                     Button { showPhotos = true } label: { Label("照片", systemImage: "photo").font(.subheadline) }
-                    Button { showFiles = true } label: { Label("文件", systemImage: "folder").font(.subheadline) }
+                    Button { activeSheet = .files } label: { Label("文件", systemImage: "folder").font(.subheadline) }
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.top, 8)
@@ -1519,7 +1549,7 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarLeading) {
-                    Button { showConvList = true } label: { Image(systemName: "list.bullet") }
+                    Button { activeSheet = .convList } label: { Image(systemName: "list.bullet") }
                     Button { store.newConversation() } label: { Image(systemName: "square.and.pencil") }
                         .accessibilityLabel("新建对话")
                 }
@@ -1530,17 +1560,25 @@ struct ContentView: View {
                         Button("导出为 Markdown") { exportCurrent("md") }
                         Button("导出为 HTML") { exportCurrent("html") }
                     } label: { Image(systemName: "square.and.arrow.up") }
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    Button { activeSheet = .settings } label: { Image(systemName: "gearshape") }
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("收起键盘") { inputFocused = false }
                 }
             }
-            .sheet(isPresented: $showSettings) { SettingsView(store: store) }
-            .sheet(isPresented: $showConvList) { ConversationListView(store: store) }
-            .sheet(isPresented: $showAI) { AISelectorView(store: store) }
-            .sheet(isPresented: $showExport) { ActivityView(items: exportItems) }
+            .sheet(item: $activeSheet) { sheet in
+                switch sheet {
+                case .settings: SettingsView(store: store)
+                case .convList: ConversationListView(store: store)
+                case .ai: AISelectorView(store: store)
+                case .export: ActivityView(items: exportItems)
+                case .files:
+                    DocumentPicker(allowsMultiple: true, contentTypes: [.data]) { urls in
+                        handlePickedFiles(urls)
+                    }
+                }
+            }
             .photosPicker(isPresented: $showPhotos, selection: $photoItems, maxSelectionCount: 0, matching: .images)
             .onChange(of: photoItems) { items in
                 guard !items.isEmpty else { return }
@@ -1554,20 +1592,6 @@ struct ContentView: View {
                     await MainActor.run { picked.append(contentsOf: arr); photoItems = [] }
                 }
             }
-            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
-                switch result {
-                case .success(let urls):
-                    var arr: [PickedFile] = []
-                    var failed: [String] = []
-                    for url in urls {
-                        if let pf = FileClassifier.make(from: url) { arr.append(pf) } else { failed.append(url.lastPathComponent) }
-                    }
-                    if !arr.isEmpty { picked.append(contentsOf: arr) }
-                    if !failed.isEmpty { store.errorText = "无法读取文件：" + failed.joined(separator: "、") }
-                case .failure(let e):
-                    store.errorText = "选取文件失败：\(e.localizedDescription)"
-                }
-            }
         }
     }
 
@@ -1577,7 +1601,19 @@ struct ContentView: View {
 
     private func exportCurrent(_ ext: String) {
         let current = store.currentIndex.map { [store.conversations[$0]] } ?? store.conversations
-        if let url = store.writeTemp(current, ext: ext) { exportItems = [url]; showExport = true }
+        if let url = store.writeTemp(current, ext: ext) { exportItems = [url]; activeSheet = .export }
+    }
+
+    private func handlePickedFiles(_ urls: [URL]) {
+        activeSheet = nil
+        guard !urls.isEmpty else { return }
+        var arr: [PickedFile] = []
+        var failed: [String] = []
+        for url in urls {
+            if let pf = FileClassifier.make(from: url) { arr.append(pf) } else { failed.append(url.lastPathComponent) }
+        }
+        if !arr.isEmpty { picked.append(contentsOf: arr) }
+        if !failed.isEmpty { store.errorText = "无法读取文件：" + failed.joined(separator: "、") }
     }
 }
 
@@ -1677,9 +1713,8 @@ struct AISelectorView: View {
 struct ConversationListView: View {
     @ObservedObject var store: ChatStore
     @Environment(\.dismiss) var dismiss
-    @State private var showImport = false
+    @State private var activeConvSheet: ConvSheet?
     @State private var exportItems: [Any] = []
-    @State private var showExport = false
 
     var body: some View {
         NavigationView {
@@ -1690,7 +1725,7 @@ struct ConversationListView: View {
                     }
                 }
                 Section(header: Text("导入 / 导出")) {
-                    Button { showImport = true } label: {
+                    Button { activeConvSheet = .importFile } label: {
                         Label("导入对话（ZIP / JSON / TXT / Markdown / HTML，兼容 Chatbox）", systemImage: "square.and.arrow.down")
                     }
                     Menu {
@@ -1731,25 +1766,26 @@ struct ConversationListView: View {
                 ToolbarItem(placement: .navigationBarLeading) { EditButton() }
                 ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
             }
-            .fileImporter(isPresented: $showImport, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
-                switch result {
-                case .success(let urls):
-                    if let url = urls.first {
+            .sheet(item: $activeConvSheet) { sheet in
+                switch sheet {
+                case .importFile:
+                    DocumentPicker(allowsMultiple: false, contentTypes: [.data]) { urls in
+                        activeConvSheet = nil
+                        guard let url = urls.first else { return }
                         let n = store.importConversations(from: url)
                         if n > 0 { dismiss() }
                         else if n == 0 { store.errorText = "该文件没有可识别的对话" }
                         else { store.errorText = "无法读取该文件" }
                     }
-                case .failure(let e):
-                    store.errorText = "导入失败：\(e.localizedDescription)"
+                case .export:
+                    ActivityView(items: exportItems)
                 }
             }
-            .sheet(isPresented: $showExport) { ActivityView(items: exportItems) }
         }
     }
 
     private func exportAll(_ ext: String) {
-        if let url = store.writeTemp(store.conversations, ext: ext) { exportItems = [url]; showExport = true }
+        if let url = store.writeTemp(store.conversations, ext: ext) { exportItems = [url]; activeConvSheet = .export }
     }
 }
 
@@ -2030,7 +2066,7 @@ struct GitHubCodeView: View {
                 let dc = try await auth.requestDeviceCode()
                 status = "验证码：\(dc.userCode) —— 已打开浏览器，请到 GitHub 输入并授权"
                 UIPasteboard.general.string = dc.userCode
-                if let url = URL(string: dc.verificationURI) { UIApplication.shared.open(url) }
+                if let url = URL(string: dc.verificationURI) { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
                 let token = try await auth.pollToken(deviceCode: dc.deviceCode, interval: dc.interval)
                 store.setGitHubToken(token)
                 status = "登录成功"
