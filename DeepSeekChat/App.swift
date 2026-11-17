@@ -12,7 +12,7 @@ struct PickedFile: Identifiable {
     var data: Data
     var filename: String
     var isImage: Bool
-    var purpose: String      // user_data / text_recognition / rich_layout_recognition
+    var purpose: String
     var mimeType: String
     var isZip: Bool
 }
@@ -62,6 +62,21 @@ struct ModelsResponse: Decodable { let data: [ModelInfo] }
 
 // MARK: - 文件类型识别
 enum FileClassifier {
+    static func readData(_ url: URL) -> Data? {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        var result: Data? = nil
+        var coordError: NSError? = nil
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
+            result = try? Data(contentsOf: newURL, options: .mappedIfSafe)
+            if result == nil { result = try? Data(contentsOf: newURL) }
+        }
+        if result == nil { result = try? Data(contentsOf: url, options: .mappedIfSafe) }
+        if result == nil { result = try? Data(contentsOf: url) }
+        return result
+    }
+
     static func make(from url: URL) -> PickedFile? {
         guard let data = readData(url) else { return nil }
         let name = url.lastPathComponent
@@ -91,21 +106,6 @@ enum FileClassifier {
         }
         return PickedFile(data: data, filename: name, isImage: isImage,
                           purpose: purpose, mimeType: mime, isZip: isZip)
-    }
-
-    static func readData(_ url: URL) -> Data? {
-        let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
-        var result: Data? = nil
-        var coordError: NSError? = nil
-        let coordinator = NSFileCoordinator()
-        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
-            result = try? Data(contentsOf: newURL, options: .mappedIfSafe)
-            if result == nil { result = try? Data(contentsOf: newURL) }
-        }
-        if result == nil { result = try? Data(contentsOf: url, options: .mappedIfSafe) }
-        if result == nil { result = try? Data(contentsOf: url) }
-        return result
     }
 
     static func image(from data: Data) -> PickedFile? {
@@ -165,7 +165,7 @@ enum Keychain {
     }
 }
 
-// MARK: - ZIP 解析（本地解压并抽取文本）
+// MARK: - ZIP 解析
 enum ZipReader {
     static func extractText(from data: Data, maxTotal: Int = 150_000) -> String {
         guard data.count > 22 else { return "" }
@@ -245,13 +245,14 @@ enum ZipReader {
     }
 
     private static func inflate(_ input: Data, expected: Int) -> Data? {
-        let capacity = max(expected, input.count * 4, 4096)
+        let inputCount = input.count
+        let capacity = max(expected, inputCount * 4, 4096)
         var dst = Data(count: capacity)
         let n = dst.withUnsafeMutableBytes { (dptr: UnsafeMutableRawBufferPointer) -> Int in
             input.withUnsafeBytes { (sptr: UnsafeRawBufferPointer) -> Int in
                 guard let dbase = dptr.bindMemory(to: UInt8.self).baseAddress,
                       let sbase = sptr.bindMemory(to: UInt8.self).baseAddress else { return 0 }
-                return compression_decode_buffer(dbase, capacity, sbase, input.count, nil, COMPRESSION_ZLIB)
+                return compression_decode_buffer(dbase, capacity, sbase, inputCount, nil, COMPRESSION_ZLIB)
             }
         }
         if n <= 0 { return nil }
@@ -267,6 +268,171 @@ enum ZipReader {
         let i = d.startIndex + off
         guard i + 3 < d.endIndex else { return 0 }
         return Int(d[i]) | (Int(d[i + 1]) << 8) | (Int(d[i + 2]) << 16) | (Int(d[i + 3]) << 24)
+    }
+
+    // 解出 zip 中的文件原始数据（可按扩展名过滤），用于导入 Chatbox 等导出的 ZIP
+    static func extractFiles(from data: Data, onlyExtensions: Set<String>?, maxEach: Int = 30_000_000, maxTotal: Int = 80_000_000) -> [(String, Data)] {
+        var out: [(String, Data)] = []
+        guard data.count > 22 else { return out }
+        var eocd = -1
+        let minPos = max(0, data.count - 22 - 65535)
+        var i = data.count - 22
+        while i >= minPos {
+            if u32(data, i) == 0x06054b50 { eocd = i; break }
+            i -= 1
+        }
+        guard eocd >= 0 else { return out }
+        let total = u16(data, eocd + 10)
+        let cdOffset = u32(data, eocd + 16)
+        guard cdOffset > 0, cdOffset < data.count else { return out }
+        var pos = cdOffset
+        var idx = 0
+        var totalBytes = 0
+        while idx < total, pos + 46 <= data.count {
+            guard u32(data, pos) == 0x02014b50 else { break }
+            let method = u16(data, pos + 10)
+            let compSize = u32(data, pos + 20)
+            let uncompSize = u32(data, pos + 24)
+            let nameLen = u16(data, pos + 28)
+            let extraLen = u16(data, pos + 30)
+            let commentLen = u16(data, pos + 32)
+            let localOff = u32(data, pos + 42)
+            guard pos + 46 + nameLen <= data.count else { break }
+            let name = String(data: data.subdata(in: pos + 46 ..< pos + 46 + nameLen), encoding: .utf8) ?? "file\(idx)"
+            let ext = (name.lowercased() as NSString).pathExtension
+            let wanted = (onlyExtensions == nil) || onlyExtensions!.contains(ext)
+            if wanted, !name.hasSuffix("/"), localOff + 30 <= data.count {
+                let lnameLen = u16(data, localOff + 26)
+                let lextraLen = u16(data, localOff + 28)
+                let dataStart = localOff + 30 + lnameLen + lextraLen
+                if dataStart + compSize <= data.count, compSize > 0, compSize <= maxEach {
+                    let comp = data.subdata(in: dataStart ..< dataStart + compSize)
+                    var fd: Data? = nil
+                    if method == 0 { fd = comp }
+                    else if method == 8 { fd = inflate(comp, expected: min(uncompSize, maxEach)) }
+                    if let fd = fd {
+                        out.append((name, fd))
+                        totalBytes += fd.count
+                        if totalBytes > maxTotal { break }
+                    }
+                }
+            }
+            pos += 46 + nameLen + extraLen + commentLen
+            idx += 1
+        }
+        return out
+    }
+}
+
+// MARK: - 导入解析（兼容 Chatbox / 通用 JSON）
+enum ConversationImporter {
+    private static func isZipData(_ d: Data) -> Bool {
+        guard d.count >= 4 else { return false }
+        let base = d.startIndex
+        return d[base] == 0x50 && d[base + 1] == 0x4B && (d[base + 2] == 0x03 || d[base + 2] == 0x05)
+    }
+
+    static func parse(_ data: Data, filename: String = "") -> [Conversation] {
+        let isZip = filename.lowercased().hasSuffix(".zip") || isZipData(data)
+        if isZip {
+            var all: [Conversation] = []
+            let entries = ZipReader.extractFiles(from: data, onlyExtensions: ["json"])
+            for (_, d) in entries {
+                if let root = try? JSONSerialization.jsonObject(with: d) {
+                    all.append(contentsOf: parseRoot(root))
+                }
+            }
+            if all.isEmpty {
+                let entries2 = ZipReader.extractFiles(from: data, onlyExtensions: nil)
+                for (name, d) in entries2 where name.lowercased().hasSuffix(".json") {
+                    if let root = try? JSONSerialization.jsonObject(with: d) {
+                        all.append(contentsOf: parseRoot(root))
+                    }
+                }
+            }
+            return all
+        } else {
+            guard let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
+            return parseRoot(root)
+        }
+    }
+
+    private static func parseRoot(_ root: Any) -> [Conversation] {
+        if let dict = root as? [String: Any] {
+            for key in ["sessions", "conversations", "chats", "history", "data", "items"] {
+                if let arr = dict[key] as? [Any] {
+                    let convs = parseSessionArray(arr)
+                    if !convs.isEmpty { return convs }
+                }
+            }
+            if let c = parseSession(dict) { return [c] }
+            return []
+        }
+        if let arr = root as? [Any] {
+            let convs = parseSessionArray(arr)
+            if !convs.isEmpty { return convs }
+            if let msgs = parseMessages(arr) {
+                var c = Conversation()
+                c.messages = msgs
+                c.title = String((msgs.first?.content ?? "导入对话").prefix(20))
+                return [c]
+            }
+        }
+        return []
+    }
+
+    private static func parseSessionArray(_ arr: [Any]) -> [Conversation] {
+        var out: [Conversation] = []
+        for item in arr {
+            if let dict = item as? [String: Any], let c = parseSession(dict) {
+                out.append(c)
+            }
+        }
+        return out
+    }
+
+    private static func parseSession(_ dict: [String: Any]) -> Conversation? {
+        var msgArr: [Any]? = nil
+        for key in ["messages", "msgs", "chat", "items"] {
+            if let a = dict[key] as? [Any] { msgArr = a; break }
+        }
+        guard let arr = msgArr, let msgs = parseMessages(arr) else { return nil }
+        var c = Conversation()
+        var title = "导入对话"
+        for key in ["name", "title", "topic", "summary"] {
+            if let s = dict[key] as? String, !s.isEmpty { title = s; break }
+        }
+        c.title = String(title.prefix(30))
+        c.messages = msgs
+        return c
+    }
+
+    private static func parseMessages(_ arr: [Any]) -> [ChatMessage]? {
+        var msgs: [ChatMessage] = []
+        for item in arr {
+            guard let dict = item as? [String: Any] else { continue }
+            var roleStr = "user"
+            for key in ["role", "from", "sender", "type", "author"] {
+                if let s = dict[key] as? String { roleStr = s; break }
+            }
+            let low = roleStr.lowercased()
+            let isAssistant = low.contains("assist") || low.contains("ai") || low.contains("bot") || low == "model" || low == "gpt" || low == "assistant"
+            let role: ChatMessage.Role = isAssistant ? .assistant : .user
+            var content = ""
+            if let s = dict["content"] as? String { content = s }
+            else if let s = dict["text"] as? String { content = s }
+            else if let s = dict["message"] as? String { content = s }
+            else if let parts = dict["content"] as? [Any] {
+                for p in parts {
+                    if let ps = p as? String { content += ps }
+                    else if let pd = p as? [String: Any], let t = pd["text"] as? String { content += t }
+                }
+            }
+            if low.contains("system") { continue }
+            if content.isEmpty { continue }
+            msgs.append(ChatMessage(role: role, content: content, attachments: []))
+        }
+        return msgs.isEmpty ? nil : msgs
     }
 }
 
@@ -324,12 +490,12 @@ final class DeepSeekClient {
     }
 
     private func encodeMessages(_ msgs: [ChatMessage]) -> [[String: Any]] {
-        msgs.map { m in
-            let files = (m.attachments).filter { $0.fileId != nil }
+        msgs.map { m -> [String: Any] in
+            let files = m.attachments.filter { $0.fileId != nil }
             if !files.isEmpty {
                 var blocks: [[String: Any]] = []
                 if !m.content.isEmpty { blocks.append(["type": "text", "text": m.content]) }
-                for f in files { blocks.append(["type": "file", "file_id": f.fileId!]) }
+                for f in files { if let fid = f.fileId { blocks.append(["type": "file", "file_id": fid]) } }
                 return ["role": m.role.rawValue, "content": blocks]
             } else {
                 return ["role": m.role.rawValue, "content": m.content]
@@ -354,10 +520,11 @@ final class DeepSeekClient {
                         "messages": encodeMessages(messages)
                     ]
                     if webSearch {
-                        body["tools"] = [
+                        let tools: [[String: Any]] = [
                             ["type": "deepseek_web_search"],
                             ["type": "deepseek_read_url"]
                         ]
+                        body["tools"] = tools
                     }
                     req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -422,14 +589,14 @@ final class ChatStore: ObservableObject {
     @Published var errorText: String?
     @Published var statusText: String?
 
-    @Published var apiBase: String
+    @Published var apiBase: String = "https://api.deepseek.com"
     @Published var models: [ModelInfo] = [
         ModelInfo(id: "deepseek-chat", name: "deepseek-chat", owned_by: nil, input_modalities: ["text"]),
         ModelInfo(id: "deepseek-reasoner", name: "deepseek-reasoner", owned_by: nil, input_modalities: ["text"])
     ]
-    @Published var selectedModel: String
-    @Published var webSearch: Bool
-    var apiKey: String
+    @Published var selectedModel: String = "deepseek-chat"
+    @Published var webSearch: Bool = false
+    var apiKey: String = ""
 
     private var fileURL: URL {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -444,7 +611,6 @@ final class ChatStore: ObservableObject {
         load()
     }
 
-    // 当前会话
     var currentIndex: Int? { conversations.firstIndex { $0.id == currentID } }
     var messages: [ChatMessage] {
         if let i = currentIndex { return conversations[i].messages }
@@ -454,11 +620,7 @@ final class ChatStore: ObservableObject {
         if let i = currentIndex { return conversations[i].title }
         return "我的 DeepSeek"
     }
-    var currentModelDisplay: String {
-        models.first(where: { $0.id == selectedModel })?.display ?? selectedModel
-    }
 
-    // 持久化
     func load() {
         if let data = try? Data(contentsOf: fileURL),
            let decoded = try? JSONDecoder().decode([Conversation].self, from: data),
@@ -484,7 +646,6 @@ final class ChatStore: ObservableObject {
         UserDefaults.standard.set(currentID.uuidString, forKey: "currentID")
     }
 
-    // 会话操作
     func newConversation() {
         let c = Conversation()
         conversations.insert(c, at: 0)
@@ -541,15 +702,42 @@ final class ChatStore: ObservableObject {
         conversations[i] = conv
     }
 
-    func exportText() -> String {
-        var s = "# \(currentTitle)\n\n"
-        for m in messages {
-            s += (m.role == .user ? "我：" : "AI：") + m.content + "\n\n"
-            for a in m.attachments {
-                s += "［附件：\(a.filename)］\n"
+    // MARK: 导入 / 导出
+    func exportJSON(_ convs: [Conversation]) -> String {
+        var sessions: [[String: Any]] = []
+        for c in convs {
+            var msgs: [[String: Any]] = []
+            for m in c.messages where !m.content.isEmpty {
+                msgs.append(["role": m.role == .user ? "user" : "assistant", "content": m.content])
             }
+            sessions.append(["name": c.title, "messages": msgs])
         }
-        return s
+        let root: [String: Any] = ["source": "deepseek-chat-ios", "sessions": sessions]
+        guard let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .withoutEscapingSlashes]),
+              let str = String(data: data, encoding: .utf8) else { return "{}" }
+        return str
+    }
+
+    func writeTempExport(_ convs: [Conversation]) -> URL? {
+        let json = exportJSON(convs)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("对话导出.json")
+        do {
+            try json.data(using: .utf8)?.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    @discardableResult
+    func importConversations(from url: URL) -> Int {
+        guard let data = FileClassifier.readData(url) else { return -1 }
+        let convs = ConversationImporter.parse(data, filename: url.lastPathComponent)
+        guard !convs.isEmpty else { return 0 }
+        conversations.insert(contentsOf: convs, at: 0)
+        if let f = convs.first { currentID = f.id }
+        persist()
+        return convs.count
     }
 
     // 设置
@@ -669,6 +857,15 @@ final class ChatStore: ObservableObject {
     }
 }
 
+// MARK: - 系统分享面板（导出文件用）
+struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
 // MARK: - 附件预览
 struct AttachmentChip: View {
     let att: MessageAttachment
@@ -695,7 +892,7 @@ struct MessageRow: View {
     var body: some View {
         let isUser = message.role == .user
         HStack(alignment: .top, spacing: 8) {
-            if isUser { Spacer(minLength: 50) }
+            if isUser { Spacer(minLength: 40) }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
                 ForEach(message.attachments) { att in
                     AttachmentChip(att: att)
@@ -718,7 +915,7 @@ struct MessageRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                 }
             }
-            if !isUser { Spacer(minLength: 50) }
+            if !isUser { Spacer(minLength: 40) }
         }
     }
 }
@@ -733,6 +930,8 @@ struct ContentView: View {
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var showPhotos = false
     @State private var showFiles = false
+    @State private var exportItems: [Any] = []
+    @State private var showExport = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -772,6 +971,26 @@ struct ContentView: View {
 
                 Divider()
 
+                // 附件区（一眼可见的按钮）
+                HStack(spacing: 10) {
+                    Button { showPhotos = true } label: {
+                        Label("照片", systemImage: "photo")
+                            .font(.subheadline)
+                    }
+                    Button { showFiles = true } label: {
+                        Label("文件", systemImage: "folder")
+                            .font(.subheadline)
+                    }
+                    Button { store.toggleWebSearch() } label: {
+                        Label("联网", systemImage: "globe")
+                            .font(.subheadline)
+                    }
+                    .tint(store.webSearch ? Color.green : Color.gray)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+
                 if !picked.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
@@ -796,25 +1015,11 @@ struct ContentView: View {
                             }
                         }
                         .padding(.horizontal, 12)
-                        .padding(.top, 8)
+                        .padding(.top, 6)
                     }
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
-                    Menu {
-                        Button { showPhotos = true } label: { Label("照片（可多选）", systemImage: "photo") }
-                        Button { showFiles = true } label: { Label("文件（可多选，含 ZIP）", systemImage: "folder") }
-                    } label: {
-                        Image(systemName: "paperclip").font(.system(size: 20)).padding(.bottom, 8)
-                    }
-
-                    Button { store.toggleWebSearch() } label: {
-                        Image(systemName: "globe")
-                            .font(.system(size: 20))
-                            .foregroundColor(store.webSearch ? .accentColor : .secondary)
-                            .padding(.bottom, 8)
-                    }
-
                     TextField("输入消息…", text: $input, axis: .vertical)
                         .focused($inputFocused)
                         .lineLimit(1...5)
@@ -848,7 +1053,13 @@ struct ContentView: View {
                     Button { showConvList = true } label: { Image(systemName: "list.bullet") }
                 }
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    ShareLink(item: store.exportText()) {
+                    Button {
+                        let current = store.currentIndex.map { [store.conversations[$0]] } ?? store.conversations
+                        if let url = store.writeTempExport(current) {
+                            exportItems = [url]
+                            showExport = true
+                        }
+                    } label: {
                         Image(systemName: "square.and.arrow.up")
                     }
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
@@ -860,6 +1071,7 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings) { SettingsView(store: store) }
             .sheet(isPresented: $showConvList) { ConversationListView(store: store) }
+            .sheet(isPresented: $showExport) { ActivityView(items: exportItems) }
             .photosPicker(isPresented: $showPhotos, selection: $photoItems, maxSelectionCount: 0, matching: .images)
             .onChange(of: photoItems) { items in
                 guard !items.isEmpty else { return }
@@ -904,6 +1116,9 @@ struct ContentView: View {
 struct ConversationListView: View {
     @ObservedObject var store: ChatStore
     @Environment(\.dismiss) var dismiss
+    @State private var showImport = false
+    @State private var exportItems: [Any] = []
+    @State private var showExport = false
 
     var body: some View {
         NavigationView {
@@ -916,6 +1131,23 @@ struct ConversationListView: View {
                         Label("新建对话", systemImage: "plus.circle.fill")
                     }
                 }
+
+                Section(header: Text("导入 / 导出")) {
+                    Button {
+                        showImport = true
+                    } label: {
+                        Label("导入对话（兼容 Chatbox 导出 ZIP/JSON）", systemImage: "square.and.arrow.down")
+                    }
+                    Button {
+                        if let url = store.writeTempExport(store.conversations) {
+                            exportItems = [url]
+                            showExport = true
+                        }
+                    } label: {
+                        Label("导出全部对话（JSON）", systemImage: "square.and.arrow.up")
+                    }
+                }
+
                 Section(header: Text("历史对话")) {
                     ForEach(store.conversations) { conv in
                         HStack {
@@ -966,6 +1198,24 @@ struct ConversationListView: View {
                     Button("完成") { dismiss() }
                 }
             }
+            .fileImporter(isPresented: $showImport, allowedContentTypes: [.zip, .json, .text, .data], allowsMultipleSelection: false) { result in
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first {
+                        let n = store.importConversations(from: url)
+                        if n > 0 {
+                            dismiss()
+                        } else if n == 0 {
+                            store.errorText = "该文件没有可识别的对话"
+                        } else {
+                            store.errorText = "无法读取该文件"
+                        }
+                    }
+                case .failure(let e):
+                    store.errorText = "导入失败：\(e.localizedDescription)"
+                }
+            }
+            .sheet(isPresented: $showExport) { ActivityView(items: exportItems) }
         }
     }
 }
@@ -1023,7 +1273,7 @@ struct SettingsView: View {
                         .foregroundColor(.secondary)
                 }
                 Section(header: Text("文件 / 压缩包说明")) {
-                    Text("可一次选多个文件或照片。发送文件/图片/ZIP 时会自动改用 deepseek-flash 模型。ZIP 会在本机解压、抽取其中文本文件内容再交给模型（图片/二进制文件会被忽略）。")
+                    Text("可一次选多个文件或照片。发送文件/图片/ZIP 时会自动改用 deepseek-flash 模型。ZIP 会在本机解压、抽取其中文本文件内容再交给模型。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
