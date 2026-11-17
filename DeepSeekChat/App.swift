@@ -294,6 +294,76 @@ enum ZipReader {
     }
 }
 
+// MARK: - ZIP 生成（store 方式，导出用）
+enum ZipWriter {
+    private static let crcTable: [UInt32] = (0..<256).map { i -> UInt32 in
+        var c = UInt32(i)
+        for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1) }
+        return c
+    }
+    private static func crc32(_ data: Data) -> UInt32 {
+        var c: UInt32 = 0xFFFFFFFF
+        for b in data { c = crcTable[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8) }
+        return c ^ 0xFFFFFFFF
+    }
+    private static func u16le(_ v: Int) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)] }
+    private static func u32le(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)] }
+
+    static func create(files: [(String, Data)]) -> Data {
+        var out = Data()
+        var central = Data()
+        for (name, data) in files {
+            let nameData = Data(name.utf8)
+            let crc = crc32(data)
+            let offset = UInt32(out.count)
+            out.append(contentsOf: u32le(0x04034b50))
+            out.append(contentsOf: u16le(20))
+            out.append(contentsOf: u16le(0))
+            out.append(contentsOf: u16le(0))
+            out.append(contentsOf: u16le(0))
+            out.append(contentsOf: u16le(0))
+            out.append(contentsOf: u32le(crc))
+            out.append(contentsOf: u32le(UInt32(data.count)))
+            out.append(contentsOf: u32le(UInt32(data.count)))
+            out.append(contentsOf: u16le(nameData.count))
+            out.append(contentsOf: u16le(0))
+            out.append(nameData)
+            out.append(data)
+
+            central.append(contentsOf: u32le(0x02014b50))
+            central.append(contentsOf: u16le(20))
+            central.append(contentsOf: u16le(20))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u32le(crc))
+            central.append(contentsOf: u32le(UInt32(data.count)))
+            central.append(contentsOf: u32le(UInt32(data.count)))
+            central.append(contentsOf: u16le(nameData.count))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u16le(0))
+            central.append(contentsOf: u32le(0))
+            central.append(contentsOf: u32le(offset))
+            central.append(nameData)
+        }
+        let cdOffset = UInt32(out.count)
+        out.append(central)
+        let cdSize = UInt32(central.count)
+        out.append(contentsOf: u32le(0x06054b50))
+        out.append(contentsOf: u16le(0))
+        out.append(contentsOf: u16le(0))
+        out.append(contentsOf: u16le(files.count))
+        out.append(contentsOf: u16le(files.count))
+        out.append(contentsOf: u32le(cdSize))
+        out.append(contentsOf: u32le(cdOffset))
+        out.append(contentsOf: u16le(0))
+        return out
+    }
+}
+
 // MARK: - 导入解析（兼容 Chatbox / 通用 JSON / ZIP）
 enum ConversationImporter {
     private static func isZipData(_ d: Data) -> Bool {
@@ -303,28 +373,114 @@ enum ConversationImporter {
     }
 
     static func parse(_ data: Data, filename: String = "") -> [Conversation] {
-        let isZip = filename.lowercased().hasSuffix(".zip") || isZipData(data)
+        let lower = filename.lowercased()
+        let isZip = lower.hasSuffix(".zip") || isZipData(data)
         if isZip {
             var all: [Conversation] = []
             let entries = ZipReader.extractFiles(from: data, onlyExtensions: ["json"])
             for (_, d) in entries {
-                if let root = try? JSONSerialization.jsonObject(with: d) {
-                    all.append(contentsOf: parseRoot(root))
-                }
+                if let root = try? JSONSerialization.jsonObject(with: d) { all.append(contentsOf: parseRoot(root)) }
             }
             if all.isEmpty {
                 let entries2 = ZipReader.extractFiles(from: data, onlyExtensions: nil)
                 for (name, d) in entries2 where name.lowercased().hasSuffix(".json") {
-                    if let root = try? JSONSerialization.jsonObject(with: d) {
-                        all.append(contentsOf: parseRoot(root))
-                    }
+                    if let root = try? JSONSerialization.jsonObject(with: d) { all.append(contentsOf: parseRoot(root)) }
                 }
             }
             return all
-        } else {
-            guard let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
-            return parseRoot(root)
         }
+        if let root = try? JSONSerialization.jsonObject(with: data) { return parseRoot(root) }
+        let text = String(data: data, encoding: .utf8) ?? ""
+        if lower.hasSuffix(".html") || lower.hasSuffix(".htm") || text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<") {
+            let c = parseHTML(text); if !c.isEmpty { return c }
+        }
+        if lower.hasSuffix(".md") || lower.hasSuffix(".markdown") {
+            let c = parseMarkdown(text); if !c.isEmpty { return c }
+        }
+        return parseText(text)
+    }
+
+    private static func parseText(_ text: String) -> [Conversation] {
+        var convs: [Conversation] = []
+        var messages: [ChatMessage] = []
+        var title = "导入对话"
+        func flush() {
+            if !messages.isEmpty { var c = Conversation(); c.title = title; c.messages = messages; convs.append(c) }
+            messages = []; title = "导入对话"
+        }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { continue }
+            if t.hasPrefix("【") && t.hasSuffix("】") { flush(); title = String(t.dropFirst().dropLast()); continue }
+            if line.hasPrefix("我：") {
+                messages.append(ChatMessage(role: .user, content: String(line.dropFirst(2)), attachments: []))
+            } else if line.hasPrefix("AI：") {
+                messages.append(ChatMessage(role: .assistant, content: String(line.dropFirst(3)), attachments: []))
+            } else if var last = messages.last {
+                last.content += "\n" + line
+                messages[messages.count - 1] = last
+            } else {
+                messages.append(ChatMessage(role: .user, content: line, attachments: []))
+            }
+        }
+        flush()
+        return convs
+    }
+
+    private static func parseMarkdown(_ text: String) -> [Conversation] {
+        var convs: [Conversation] = []
+        var messages: [ChatMessage] = []
+        var title = "导入对话"
+        var pendingUser = false
+        func flushConv() {
+            if !messages.isEmpty { var c = Conversation(); c.title = title; c.messages = messages; convs.append(c) }
+            messages = []; title = "导入对话"
+        }
+        for blockRaw in text.components(separatedBy: "\n\n") {
+            let block = blockRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if block.isEmpty { continue }
+            if block.hasPrefix("# ") { flushConv(); title = String(block.dropFirst(2)); pendingUser = false; continue }
+            if block == "---" { flushConv(); pendingUser = false; continue }
+            if block == "**我：**" || block == "**我:**" { pendingUser = true; continue }
+            let role: ChatMessage.Role = pendingUser ? .user : .assistant
+            messages.append(ChatMessage(role: role, content: block, attachments: []))
+            pendingUser = false
+        }
+        flushConv()
+        return convs
+    }
+
+    private static func unescapeHTML(_ s: String) -> String {
+        s.replacingOccurrences(of: "<br>", with: "\n")
+         .replacingOccurrences(of: "<br/>", with: "\n")
+         .replacingOccurrences(of: "&lt;", with: "<")
+         .replacingOccurrences(of: "&gt;", with: ">")
+         .replacingOccurrences(of: "&amp;", with: "&")
+    }
+
+    private static func parseHTML(_ html: String) -> [Conversation] {
+        var convs: [Conversation] = []
+        var messages: [ChatMessage] = []
+        var title = "导入对话"
+        func flushConv() {
+            if !messages.isEmpty { var c = Conversation(); c.title = title; c.messages = messages; convs.append(c) }
+            messages = []; title = "导入对话"
+        }
+        let pattern = "<h2>(.*?)</h2>|<p><b>(我|AI)：</b>(.*?)</p>"
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators, .caseInsensitive]) else { return [] }
+        let ns = html as NSString
+        for m in re.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+            if m.range(at: 1).location != NSNotFound {
+                flushConv(); title = unescapeHTML(ns.substring(with: m.range(at: 1)))
+            } else {
+                let who = m.range(at: 2).location != NSNotFound ? ns.substring(with: m.range(at: 2)) : ""
+                let content = m.range(at: 3).location != NSNotFound ? unescapeHTML(ns.substring(with: m.range(at: 3))) : ""
+                messages.append(ChatMessage(role: who == "我" ? .user : .assistant, content: content, attachments: []))
+            }
+        }
+        flushConv()
+        return convs
     }
 
     private static func parseRoot(_ root: Any) -> [Conversation] {
@@ -561,6 +717,77 @@ final class ChatClient {
     }
 }
 
+// MARK: - GitHub 登录（OAuth 设备码，App 内拉起）
+final class GitHubAuth {
+    let clientID: String
+    init(clientID: String) { self.clientID = clientID }
+
+    struct DeviceCode {
+        let deviceCode: String
+        let userCode: String
+        let verificationURI: String
+        let interval: Int
+    }
+    enum AuthError: Error { case message(String) }
+
+    private func post(_ urlStr: String, form: [String: String]) async throws -> [String: Any] {
+        guard let url = URL(string: urlStr) else { throw AuthError.message("地址无效") }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.setValue("deepseek-chat-ios", forHTTPHeaderField: "User-Agent")
+        var comps: [String] = []
+        for (k, v) in form {
+            let ek = k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k
+            let ev = v.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? v
+            comps.append("\(ek)=\(ev)")
+        }
+        req.httpBody = comps.joined(separator: "&").data(using: .utf8)
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AuthError.message("返回异常\n" + (String(data: data, encoding: .utf8) ?? ""))
+        }
+        return obj
+    }
+
+    func requestDeviceCode(scope: String = "repo") async throws -> DeviceCode {
+        let obj = try await post("https://github.com/login/device/code", form: ["client_id": clientID, "scope": scope])
+        if let err = obj["error"] as? String {
+            throw AuthError.message(err + " " + (obj["error_description"] as? String ?? ""))
+        }
+        guard let dc = obj["device_code"] as? String,
+              let uc = obj["user_code"] as? String,
+              let vu = obj["verification_uri"] as? String,
+              let interval = obj["interval"] as? Int else {
+            throw AuthError.message("解析失败")
+        }
+        return DeviceCode(deviceCode: dc, userCode: uc, verificationURI: vu, interval: interval)
+    }
+
+    func pollToken(deviceCode: String, interval: Int) async throws -> String {
+        var wait = max(interval, 5)
+        let start = Date()
+        while Date().timeIntervalSince(start) < 900 {
+            try? await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000_000)
+            let obj = try await post("https://github.com/login/oauth/access_token", form: [
+                "client_id": clientID,
+                "device_code": deviceCode,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            ])
+            if let token = obj["access_token"] as? String { return token }
+            if let err = obj["error"] as? String {
+                if err == "authorization_pending" { continue }
+                else if err == "slow_down" { wait += 5; continue }
+                else if err == "expired_token" { throw AuthError.message("验证码已过期，请重新登录") }
+                else if err == "access_denied" { throw AuthError.message("你取消了授权") }
+                else { throw AuthError.message(err) }
+            }
+        }
+        throw AuthError.message("超时")
+    }
+}
+
 // MARK: - GitHub 客户端（REST API，读/改/提交）
 final class GitHubClient {
     let token: String
@@ -659,6 +886,8 @@ final class ChatStore: ObservableObject {
     @Published var ghOwner: String = ""
     @Published var ghRepo: String = ""
     @Published var ghBranch: String = "main"
+    @Published var ghClientID: String = ""
+    @Published var ghLoggedIn: Bool = false
     var ghToken: String = ""
 
     private var convURL: URL {
@@ -786,18 +1015,32 @@ final class ChatStore: ObservableObject {
         ghOwner = UserDefaults.standard.string(forKey: "ghOwner") ?? ""
         ghRepo = UserDefaults.standard.string(forKey: "ghRepo") ?? ""
         ghBranch = UserDefaults.standard.string(forKey: "ghBranch") ?? "main"
+        ghClientID = UserDefaults.standard.string(forKey: "ghClientID") ?? ""
         ghToken = Keychain.read("github_token")
+        ghLoggedIn = !ghToken.isEmpty
     }
 
-    func saveGitHub(token: String, owner: String, repo: String, branch: String) {
-        ghToken = token
+    func saveGitHubConfig(owner: String, repo: String, branch: String, clientID: String) {
         ghOwner = owner
         ghRepo = repo
         ghBranch = branch.isEmpty ? "main" : branch
-        Keychain.save(token, for: "github_token")
+        ghClientID = clientID
         UserDefaults.standard.set(ghOwner, forKey: "ghOwner")
         UserDefaults.standard.set(ghRepo, forKey: "ghRepo")
         UserDefaults.standard.set(ghBranch, forKey: "ghBranch")
+        UserDefaults.standard.set(ghClientID, forKey: "ghClientID")
+    }
+
+    func setGitHubToken(_ token: String) {
+        ghToken = token
+        ghLoggedIn = !token.isEmpty
+        Keychain.save(token, for: "github_token")
+    }
+
+    func clearGitHubToken() {
+        ghToken = ""
+        ghLoggedIn = false
+        Keychain.save("", for: "github_token")
     }
 
     var isGitHubConfigured: Bool { !ghToken.isEmpty && !ghOwner.isEmpty && !ghRepo.isEmpty }
@@ -956,12 +1199,73 @@ final class ChatStore: ObservableObject {
     }
 
     func writeTempExport(_ convs: [Conversation]) -> URL? {
-        let json = exportJSON(convs)
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("对话导出.json")
-        do {
-            try json.data(using: .utf8)?.write(to: url)
-            return url
-        } catch { return nil }
+        return writeTemp(convs, ext: "zip")
+    }
+
+    func exportPlain(_ convs: [Conversation]) -> String {
+        var s = ""
+        for c in convs {
+            s += "【\(c.title)】\n"
+            for m in c.messages where !m.content.isEmpty {
+                s += (m.role == .user ? "我：" : "AI：") + m.content + "\n"
+            }
+            s += "\n"
+        }
+        return s
+    }
+
+    func exportMarkdown(_ convs: [Conversation]) -> String {
+        var s = ""
+        for c in convs {
+            s += "# \(c.title)\n\n"
+            for m in c.messages where !m.content.isEmpty {
+                if m.role == .user { s += "**我：**\n\n" + m.content + "\n\n" }
+                else { s += m.content + "\n\n" }
+            }
+            s += "---\n\n"
+        }
+        return s
+    }
+
+    func exportHTML(_ convs: [Conversation]) -> String {
+        func esc(_ t: String) -> String {
+            t.replacingOccurrences(of: "&", with: "&amp;")
+             .replacingOccurrences(of: "<", with: "&lt;")
+             .replacingOccurrences(of: ">", with: "&gt;")
+             .replacingOccurrences(of: "\n", with: "<br>")
+        }
+        var body = ""
+        for c in convs {
+            body += "<h2>\(esc(c.title))</h2>"
+            for m in c.messages where !m.content.isEmpty {
+                let who = m.role == .user ? "我" : "AI"
+                body += "<p><b>\(who)：</b>\(esc(m.content))</p>"
+            }
+            body += "<hr>"
+        }
+        return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>对话导出</title></head><body>" + body + "</body></html>"
+    }
+
+    func writeTemp(_ convs: [Conversation], ext: String) -> URL? {
+        let dir = FileManager.default.temporaryDirectory
+        let data: Data
+        let name: String
+        switch ext {
+        case "zip":
+            let json = exportJSON(convs)
+            data = ZipWriter.create(files: [("conversations.json", Data(json.utf8))])
+            name = "对话导出.zip"
+        case "txt":
+            data = Data(exportPlain(convs).utf8); name = "对话导出.txt"
+        case "md":
+            data = Data(exportMarkdown(convs).utf8); name = "对话导出.md"
+        case "html":
+            data = Data(exportHTML(convs).utf8); name = "对话导出.html"
+        default:
+            return nil
+        }
+        let url = dir.appendingPathComponent(name)
+        do { try data.write(to: url); return url } catch { return nil }
     }
 
     @discardableResult
@@ -1214,13 +1518,17 @@ struct ContentView: View {
             .navigationTitle(store.currentTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
+                ToolbarItemGroup(placement: .navigationBarLeading) {
                     Button { showConvList = true } label: { Image(systemName: "list.bullet") }
+                    Button { store.newConversation() } label: { Image(systemName: "square.and.pencil") }
+                        .accessibilityLabel("新建对话")
                 }
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    Button {
-                        let current = store.currentIndex.map { [store.conversations[$0]] } ?? store.conversations
-                        if let url = store.writeTempExport(current) { exportItems = [url]; showExport = true }
+                    Menu {
+                        Button("导出为 ZIP") { exportCurrent("zip") }
+                        Button("导出为 TXT") { exportCurrent("txt") }
+                        Button("导出为 Markdown") { exportCurrent("md") }
+                        Button("导出为 HTML") { exportCurrent("html") }
                     } label: { Image(systemName: "square.and.arrow.up") }
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
@@ -1265,6 +1573,11 @@ struct ContentView: View {
 
     private var canSend: Bool {
         !store.isSending && (!input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !picked.isEmpty)
+    }
+
+    private func exportCurrent(_ ext: String) {
+        let current = store.currentIndex.map { [store.conversations[$0]] } ?? store.conversations
+        if let url = store.writeTemp(current, ext: ext) { exportItems = [url]; showExport = true }
     }
 }
 
@@ -1378,11 +1691,14 @@ struct ConversationListView: View {
                 }
                 Section(header: Text("导入 / 导出")) {
                     Button { showImport = true } label: {
-                        Label("导入对话（兼容 Chatbox 导出 ZIP/JSON）", systemImage: "square.and.arrow.down")
+                        Label("导入对话（ZIP / JSON / TXT / Markdown / HTML，兼容 Chatbox）", systemImage: "square.and.arrow.down")
                     }
-                    Button {
-                        if let url = store.writeTempExport(store.conversations) { exportItems = [url]; showExport = true }
-                    } label: { Label("导出全部对话（JSON）", systemImage: "square.and.arrow.up") }
+                    Menu {
+                        Button("导出全部为 ZIP") { exportAll("zip") }
+                        Button("导出全部为 TXT") { exportAll("txt") }
+                        Button("导出全部为 Markdown") { exportAll("md") }
+                        Button("导出全部为 HTML") { exportAll("html") }
+                    } label: { Label("导出全部对话（ZIP / TXT / Markdown / HTML）", systemImage: "square.and.arrow.up") }
                 }
                 Section(header: Text("历史对话")) {
                     ForEach(store.conversations) { conv in
@@ -1415,7 +1731,7 @@ struct ConversationListView: View {
                 ToolbarItem(placement: .navigationBarLeading) { EditButton() }
                 ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
             }
-            .fileImporter(isPresented: $showImport, allowedContentTypes: [.zip, .json, .text, .data], allowsMultipleSelection: false) { result in
+            .fileImporter(isPresented: $showImport, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
                 switch result {
                 case .success(let urls):
                     if let url = urls.first {
@@ -1430,6 +1746,10 @@ struct ConversationListView: View {
             }
             .sheet(isPresented: $showExport) { ActivityView(items: exportItems) }
         }
+    }
+
+    private func exportAll(_ ext: String) {
+        if let url = store.writeTemp(store.conversations, ext: ext) { exportItems = [url]; showExport = true }
     }
 }
 
@@ -1530,6 +1850,7 @@ struct ProviderEditorView: View {
     @State private var name = ""
     @State private var baseURL = ""
     @State private var apis: [APIConfig] = []
+    @State private var detail: IndexBox?
 
     var body: some View {
         Form {
@@ -1541,22 +1862,30 @@ struct ProviderEditorView: View {
                     .autocapitalization(.none).disableAutocorrection(true)
             }
             Section(header: Text("API（可添加多个，各起昵称）")) {
+                if apis.isEmpty {
+                    Text("还没有 API，点下面添加").font(.caption).foregroundColor(.secondary)
+                }
                 ForEach(apis.indices, id: \.self) { i in
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("昵称，如 主号 / 备用", text: Binding(
-                            get: { apis[i].nickname },
-                            set: { apis[i].nickname = $0 }
-                        )).font(.subheadline)
-                        SecureField("API Key", text: Binding(
-                            get: { apis[i].key },
-                            set: { apis[i].key = $0 }
-                        ))
-                        .autocapitalization(.none).disableAutocorrection(true)
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(apis[i].nickname.isEmpty ? "未命名" : apis[i].nickname).font(.subheadline)
+                            Text(maskedKey(apis[i].key)).font(.caption).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button { detail = IndexBox(id: i) } label: {
+                            HStack(spacing: 2) { Image(systemName: "info.circle"); Text("详情").font(.caption) }
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundColor(.accentColor)
+                        Button(role: .destructive) { apis.remove(at: i) } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
                     }
                 }
-                .onDelete { idx in apis.remove(atOffsets: idx) }
                 Button {
                     apis.append(APIConfig(nickname: "API \(apis.count + 1)", key: ""))
+                    detail = IndexBox(id: apis.count - 1)
                 } label: { Label("添加 API", systemImage: "plus.circle") }
             }
             Section {
@@ -1567,6 +1896,14 @@ struct ProviderEditorView: View {
             }
         }
         .navigationTitle("编辑")
+        .sheet(item: $detail) { box in
+            if box.id < apis.count {
+                APIDetailEditView(
+                    api: Binding(get: { apis[box.id] }, set: { apis[box.id] = $0 }),
+                    onDelete: { apis.remove(at: box.id); detail = nil }
+                )
+            }
+        }
         .onAppear {
             if let p = store.providers.first(where: { $0.id == providerID }) {
                 name = p.name
@@ -1575,39 +1912,102 @@ struct ProviderEditorView: View {
             }
         }
     }
+
+    private func maskedKey(_ k: String) -> String {
+        if k.isEmpty { return "未填写 Key" }
+        if k.count <= 6 { return String(repeating: "•", count: k.count) }
+        return "••••••" + k.suffix(4)
+    }
 }
 
-// MARK: - GitHub 代码浏览
+// 用于 sheet(item:) 的索引包装
+struct IndexBox: Identifiable { let id: Int }
+
+// MARK: - 单个 API 详情（查看/改昵称/显示隐藏 key/删除）
+struct APIDetailEditView: View {
+    @Binding var api: APIConfig
+    var onDelete: () -> Void
+    @Environment(\.dismiss) var dismiss
+    @State private var showKey = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("昵称")) {
+                    TextField("如 主号 / 备用", text: $api.nickname)
+                }
+                Section(header: Text("API Key")) {
+                    HStack(spacing: 8) {
+                        if showKey {
+                            TextField("sk-...", text: $api.key)
+                                .autocapitalization(.none).disableAutocorrection(true)
+                                .font(.system(.caption, design: .monospaced))
+                        } else {
+                            SecureField("sk-...", text: $api.key)
+                                .autocapitalization(.none).disableAutocorrection(true)
+                        }
+                        Button { showKey.toggle() } label: {
+                            Image(systemName: showKey ? "eye.slash" : "eye")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    Text("长度 \(api.key.count) 位").font(.caption2).foregroundColor(.secondary)
+                }
+                Section {
+                    Button("删除这个 API", role: .destructive) { onDelete(); dismiss() }
+                }
+            }
+            .navigationTitle("API 详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
+            }
+        }
+    }
+}
+
+// MARK: - GitHub 代码（App 内登录 + 限制本仓库）
 struct GitHubCodeView: View {
     @ObservedObject var store: ChatStore
-    @State private var token = ""
+    @State private var clientID = ""
     @State private var owner = ""
     @State private var repo = ""
     @State private var branch = "main"
     @State private var files: [String] = []
     @State private var loading = false
+    @State private var status: String?
     @State private var errorText: String?
 
     var body: some View {
         Form {
-            Section(header: Text("GitHub 配置（令牌建议 Fine-grained，仅授权本仓库 Contents 读写）")) {
-                SecureField("GitHub 令牌 github_pat_...", text: $token)
-                TextField("仓库所有者（用户名/组织）", text: $owner).autocapitalization(.none).disableAutocorrection(true)
+            Section(header: Text("GitHub 登录（App 内完成，只需 OAuth App 的 Client ID）")) {
+                TextField("OAuth App Client ID", text: $clientID)
+                    .autocapitalization(.none).disableAutocorrection(true)
+                    .font(.system(.caption, design: .monospaced))
+                if store.ghLoggedIn {
+                    HStack(spacing: 6) { Image(systemName: "checkmark.seal.fill").foregroundColor(.green); Text("已登录 GitHub") }
+                    Button("退出登录", role: .destructive) { store.clearGitHubToken() }
+                } else {
+                    Button(loading ? "登录中…" : "使用 GitHub 登录") { login() }
+                        .disabled(loading)
+                }
+                Text("首次使用：GitHub → Settings → Developer settings → OAuth Apps 新建一个，勾选 Enable Device Flow，把 Client ID 填到上面。验证码会自动复制。")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            Section(header: Text("目标仓库（仅此仓库会被访问）")) {
+                TextField("所有者（如 colin0252）", text: $owner).autocapitalization(.none).disableAutocorrection(true)
                 TextField("仓库名", text: $repo).autocapitalization(.none).disableAutocorrection(true)
                 TextField("分支，如 main", text: $branch).autocapitalization(.none).disableAutocorrection(true)
-                Button(loading ? "加载中…" : "保存并读取文件列表") { saveAndLoad() }.disabled(loading)
+                Button(loading ? "载入中…" : "保存并读取文件列表") { saveAndLoad() }.disabled(loading)
             }
-            if let e = errorText {
-                Section { Text(e).foregroundColor(.red).font(.caption) }
-            }
+            if let s = status { Section { Text(s).foregroundColor(.secondary).font(.caption) } }
+            if let e = errorText { Section { Text(e).foregroundColor(.red).font(.caption) } }
             Section(header: Text("文件（\(files.count)）")) {
                 if files.isEmpty {
-                    Text("点上方按钮加载文件列表").foregroundColor(.secondary)
+                    Text("登录并填仓库后点上方按钮加载").foregroundColor(.secondary)
                 }
                 ForEach(files, id: \.self) { path in
-                    NavigationLink {
-                        GitHubFileView(store: store, path: path)
-                    } label: {
+                    NavigationLink { GitHubFileView(store: store, path: path) } label: {
                         Text(path).font(.caption).lineLimit(1)
                     }
                 }
@@ -1615,22 +2015,49 @@ struct GitHubCodeView: View {
         }
         .navigationTitle("GitHub 代码")
         .onAppear {
-            token = store.ghToken
-            owner = store.ghOwner
-            repo = store.ghRepo
-            branch = store.ghBranch
+            clientID = store.ghClientID; owner = store.ghOwner; repo = store.ghRepo; branch = store.ghBranch
+        }
+    }
+
+    private func login() {
+        store.saveGitHubConfig(owner: owner, repo: repo, branch: branch, clientID: clientID)
+        guard !clientID.isEmpty else { errorText = "请先填 OAuth App Client ID"; return }
+        loading = true; errorText = nil; status = "正在请求验证码…"
+        let cid = clientID
+        Task { @MainActor in
+            let auth = GitHubAuth(clientID: cid)
+            do {
+                let dc = try await auth.requestDeviceCode()
+                status = "验证码：\(dc.userCode) —— 已打开浏览器，请到 GitHub 输入并授权"
+                UIPasteboard.general.string = dc.userCode
+                if let url = URL(string: dc.verificationURI) { UIApplication.shared.open(url) }
+                let token = try await auth.pollToken(deviceCode: dc.deviceCode, interval: dc.interval)
+                store.setGitHubToken(token)
+                status = "登录成功"
+                loading = false
+                loadFiles()
+            } catch {
+                var msg = "登录失败"
+                if let e = error as? GitHubAuth.AuthError, case let .message(m) = e { msg = m }
+                else { msg = error.localizedDescription }
+                errorText = msg; status = nil; loading = false
+            }
         }
     }
 
     private func saveAndLoad() {
-        store.saveGitHub(token: token, owner: owner, repo: repo, branch: branch)
-        guard store.isGitHubConfigured else { errorText = "请填写令牌、所有者、仓库名"; return }
-        loading = true
-        errorText = nil
+        store.saveGitHubConfig(owner: owner, repo: repo, branch: branch, clientID: clientID)
+        guard store.isGitHubConfigured else { errorText = "请先登录 GitHub 并填仓库所有者/名"; return }
+        loadFiles()
+    }
+
+    private func loadFiles() {
+        guard store.isGitHubConfigured else { return }
+        loading = true; errorText = nil
         Task {
             do {
                 let list = try await store.ghClient().listFiles()
-                await MainActor.run { files = list; loading = false }
+                await MainActor.run { files = list; status = "已加载 \(list.count) 个文件"; loading = false }
             } catch {
                 let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
                 await MainActor.run { errorText = msg; loading = false }
