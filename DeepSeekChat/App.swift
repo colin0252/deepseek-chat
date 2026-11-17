@@ -424,6 +424,7 @@ final class ChatClient {
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
+    // 拉取模型列表
     func fetchModels() async throws -> [ModelInfo] {
         guard let url = URL(string: cleanedBase() + "/models") else { return [] }
         var req = URLRequest(url: url)
@@ -433,6 +434,7 @@ final class ChatClient {
         return decoded.data
     }
 
+    // DeepSeek 文件上传
     func uploadFile(_ f: PickedFile) async throws -> String {
         guard let url = URL(string: cleanedBase() + "/files") else {
             throw ChatRequestError(message: "API 地址无效")
@@ -559,6 +561,89 @@ final class ChatClient {
     }
 }
 
+// MARK: - GitHub 客户端（REST API，读/改/提交）
+final class GitHubClient {
+    let token: String
+    let owner: String
+    let repo: String
+    let branch: String
+    init(token: String, owner: String, repo: String, branch: String) {
+        self.token = token
+        self.owner = owner
+        self.repo = repo
+        self.branch = branch.isEmpty ? "main" : branch
+    }
+
+    private func makeRequest(_ urlStr: String, method: String = "GET", body: Data? = nil) -> URLRequest {
+        var req = URLRequest(url: URL(string: urlStr)!)
+        req.httpMethod = method
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        req.setValue("deepseek-chat-ios", forHTTPHeaderField: "User-Agent")
+        if let body = body {
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return req
+    }
+
+    private func encodePath(_ path: String) -> String {
+        path.split(separator: "/").map { String($0).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }.joined(separator: "/")
+    }
+
+    private func check(_ resp: URLResponse, _ data: Data, ok: [Int]) throws {
+        guard let http = resp as? HTTPURLResponse else { throw ChatRequestError(message: "无响应") }
+        if !ok.contains(http.statusCode) {
+            throw ChatRequestError(message: "HTTP \(http.statusCode)\n\(String(data: data, encoding: .utf8) ?? "")")
+        }
+    }
+
+    func listFiles() async throws -> [String] {
+        let url = "https://api.github.com/repos/\(owner)/\(repo)/git/trees/\(branch)?recursive=1"
+        let (data, resp) = try await URLSession.shared.data(for: makeRequest(url))
+        try check(resp, data, ok: [200])
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tree = obj["tree"] as? [[String: Any]] else {
+            throw ChatRequestError(message: "解析失败")
+        }
+        return tree.filter { ($0["type"] as? String) == "blob" }
+            .compactMap { $0["path"] as? String }
+            .sorted()
+    }
+
+    func getFile(path: String) async throws -> (content: String, sha: String) {
+        let url = "https://api.github.com/repos/\(owner)/\(repo)/contents/\(encodePath(path))?ref=\(branch)"
+        let (data, resp) = try await URLSession.shared.data(for: makeRequest(url))
+        try check(resp, data, ok: [200])
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sha = obj["sha"] as? String else {
+            throw ChatRequestError(message: "解析失败")
+        }
+        var content = ""
+        if let c = obj["content"] as? String {
+            let cleaned = c.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "\r", with: "")
+            if let d = Data(base64Encoded: cleaned) {
+                content = String(data: d, encoding: .utf8) ?? ""
+            }
+        }
+        return (content, sha)
+    }
+
+    func putFile(path: String, content: String, sha: String?, message: String) async throws {
+        var body: [String: Any] = [
+            "message": message,
+            "content": Data(content.utf8).base64EncodedString(),
+            "branch": branch
+        ]
+        if let sha = sha, !sha.isEmpty { body["sha"] = sha }
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let url = "https://api.github.com/repos/\(owner)/\(repo)/contents/\(encodePath(path))"
+        let (data, resp) = try await URLSession.shared.data(for: makeRequest(url, method: "PUT", body: bodyData))
+        try check(resp, data, ok: [200, 201])
+    }
+}
+
 // MARK: - 状态管理
 @MainActor
 final class ChatStore: ObservableObject {
@@ -571,6 +656,11 @@ final class ChatStore: ObservableObject {
     @Published var providers: [AIProvider] = []
     @Published var providerModels: [UUID: [ModelInfo]] = [:]
 
+    @Published var ghOwner: String = ""
+    @Published var ghRepo: String = ""
+    @Published var ghBranch: String = "main"
+    var ghToken: String = ""
+
     private var convURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("conversations.json")
     }
@@ -580,9 +670,11 @@ final class ChatStore: ObservableObject {
 
     init() {
         loadProviders()
+        loadGitHub()
         loadConversations()
     }
 
+    // 会话当前
     var currentIndex: Int? { conversations.firstIndex { $0.id == currentID } }
     var messages: [ChatMessage] {
         if let i = currentIndex { return conversations[i].messages }
@@ -593,6 +685,7 @@ final class ChatStore: ObservableObject {
         return "我的 AI"
     }
 
+    // 解析当前对话使用的 提供商 / API / 模型
     func selection() -> (AIProvider?, APIConfig?, String?) {
         let conv = currentIndex.map { conversations[$0] }
         let provider = providers.first { $0.id == conv?.providerID } ?? providers.first
@@ -623,15 +716,17 @@ final class ChatStore: ObservableObject {
         } else {
             providers = [AIProvider(name: "DeepSeek", baseURL: "https://api.deepseek.com", apis: [])]
         }
+        // 填充 key
         for i in providers.indices {
             for j in providers[i].apis.indices {
                 providers[i].apis[j].key = Keychain.read("api_\(providers[i].apis[j].id.uuidString)")
             }
         }
+        // 迁移旧的单 key
         if providers[0].apis.isEmpty {
             let old = Keychain.read("apiKey")
             if !old.isEmpty {
-                let cfg = APIConfig(nickname: "默认", key: old)
+                var cfg = APIConfig(nickname: "默认", key: old)
                 providers[0].apis.append(cfg)
                 Keychain.save(old, for: "api_\(cfg.id.uuidString)")
                 persistProviders()
@@ -681,7 +776,77 @@ final class ChatStore: ObservableObject {
         do {
             let list = try await client.fetchModels()
             if !list.isEmpty { providerModels[provider.id] = list }
-        } catch {}
+        } catch {
+            // 静默失败
+        }
+    }
+
+    // MARK: GitHub
+    func loadGitHub() {
+        ghOwner = UserDefaults.standard.string(forKey: "ghOwner") ?? ""
+        ghRepo = UserDefaults.standard.string(forKey: "ghRepo") ?? ""
+        ghBranch = UserDefaults.standard.string(forKey: "ghBranch") ?? "main"
+        ghToken = Keychain.read("github_token")
+    }
+
+    func saveGitHub(token: String, owner: String, repo: String, branch: String) {
+        ghToken = token
+        ghOwner = owner
+        ghRepo = repo
+        ghBranch = branch.isEmpty ? "main" : branch
+        Keychain.save(token, for: "github_token")
+        UserDefaults.standard.set(ghOwner, forKey: "ghOwner")
+        UserDefaults.standard.set(ghRepo, forKey: "ghRepo")
+        UserDefaults.standard.set(ghBranch, forKey: "ghBranch")
+    }
+
+    var isGitHubConfigured: Bool { !ghToken.isEmpty && !ghOwner.isEmpty && !ghRepo.isEmpty }
+
+    func ghClient() -> GitHubClient {
+        GitHubClient(token: ghToken, owner: ghOwner, repo: ghRepo, branch: ghBranch)
+    }
+
+    func modifyFileWithAI(fileName: String, current: String, instruction: String) async -> (String?, String?) {
+        let (providerOpt, apiOpt, modelOpt) = selection()
+        guard let provider = providerOpt, let api = apiOpt, let model = modelOpt, !model.isEmpty else {
+            return (nil, "请先在聊天页顶部选择 AI / API / 模型")
+        }
+        guard !api.key.isEmpty else { return (nil, "当前 API 未填写 Key") }
+        let isDeepSeek = provider.baseURL.lowercased().contains("deepseek")
+        let client = ChatClient(baseURL: provider.baseURL, apiKey: api.key, model: model, webSearch: false, isDeepSeek: isDeepSeek)
+        let prompt = """
+        你是一个代码修改助手。请根据下面的“修改要求”改写文件，直接输出修改后的【完整文件内容】，
+        不要输出任何解释、不要用 markdown 代码块包裹。只输出文件本身。
+
+        文件名：\(fileName)
+
+        ===== 原文件内容开始 =====
+        \(current)
+        ===== 原文件内容结束 =====
+
+        修改要求：\(instruction)
+        """
+        let msgs = [ChatMessage(role: .user, content: prompt, attachments: [])]
+        var result = ""
+        do {
+            for try await ev in client.stream(messages: msgs) {
+                if case .text(let t) = ev { result = t }
+            }
+            var cleaned = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            if cleaned.hasPrefix("```") {
+                if let firstNL = cleaned.firstIndex(of: "\n") {
+                    cleaned = String(cleaned[cleaned.index(after: firstNL)...])
+                }
+                if let range = cleaned.range(of: "```", options: .backwards) {
+                    cleaned = String(cleaned[..<range.lowerBound])
+                }
+                cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return (cleaned, nil)
+        } catch {
+            let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+            return (nil, msg)
+        }
     }
 
     // MARK: 持久化 - 会话
@@ -981,6 +1146,7 @@ struct ContentView: View {
 
                 Divider()
 
+                // 选择当前 AI（每个对话独立）
                 Button { showAI = true } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "cpu")
@@ -993,6 +1159,7 @@ struct ContentView: View {
                 }
                 .foregroundColor(.primary)
 
+                // 附件区
                 HStack(spacing: 10) {
                     Button { showPhotos = true } label: { Label("照片", systemImage: "photo").font(.subheadline) }
                     Button { showFiles = true } label: { Label("文件", systemImage: "folder").font(.subheadline) }
@@ -1287,6 +1454,15 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Section(header: Text("GitHub 代码（读 / 改 / 提交）")) {
+                    NavigationLink {
+                        GitHubCodeView(store: store)
+                    } label: {
+                        Label("打开 GitHub 代码", systemImage: "chevron.left.forwardslash.chevron.right")
+                    }
+                    Text(store.isGitHubConfigured ? "已配置：\(store.ghOwner)/\(store.ghRepo)@\(store.ghBranch)" : "未配置（需填令牌+仓库）")
+                        .font(.caption).foregroundColor(.secondary)
+                }
                 Section(header: Text("说明")) {
                     Text("每个对话可在聊天页顶部单独选择用哪个 AI / 哪个 API / 哪个模型。文件、ZIP、联网搜索为 DeepSeek 专属能力；其他 AI 仅支持文字与 ZIP 文本提取。")
                         .font(.caption).foregroundColor(.secondary)
@@ -1396,6 +1572,172 @@ struct ProviderEditorView: View {
                 name = p.name
                 baseURL = p.baseURL
                 apis = p.apis
+            }
+        }
+    }
+}
+
+// MARK: - GitHub 代码浏览
+struct GitHubCodeView: View {
+    @ObservedObject var store: ChatStore
+    @State private var token = ""
+    @State private var owner = ""
+    @State private var repo = ""
+    @State private var branch = "main"
+    @State private var files: [String] = []
+    @State private var loading = false
+    @State private var errorText: String?
+
+    var body: some View {
+        Form {
+            Section(header: Text("GitHub 配置（令牌建议 Fine-grained，仅授权本仓库 Contents 读写）")) {
+                SecureField("GitHub 令牌 github_pat_...", text: $token)
+                TextField("仓库所有者（用户名/组织）", text: $owner).autocapitalization(.none).disableAutocorrection(true)
+                TextField("仓库名", text: $repo).autocapitalization(.none).disableAutocorrection(true)
+                TextField("分支，如 main", text: $branch).autocapitalization(.none).disableAutocorrection(true)
+                Button(loading ? "加载中…" : "保存并读取文件列表") { saveAndLoad() }.disabled(loading)
+            }
+            if let e = errorText {
+                Section { Text(e).foregroundColor(.red).font(.caption) }
+            }
+            Section(header: Text("文件（\(files.count)）")) {
+                if files.isEmpty {
+                    Text("点上方按钮加载文件列表").foregroundColor(.secondary)
+                }
+                ForEach(files, id: \.self) { path in
+                    NavigationLink {
+                        GitHubFileView(store: store, path: path)
+                    } label: {
+                        Text(path).font(.caption).lineLimit(1)
+                    }
+                }
+            }
+        }
+        .navigationTitle("GitHub 代码")
+        .onAppear {
+            token = store.ghToken
+            owner = store.ghOwner
+            repo = store.ghRepo
+            branch = store.ghBranch
+        }
+    }
+
+    private func saveAndLoad() {
+        store.saveGitHub(token: token, owner: owner, repo: repo, branch: branch)
+        guard store.isGitHubConfigured else { errorText = "请填写令牌、所有者、仓库名"; return }
+        loading = true
+        errorText = nil
+        Task {
+            do {
+                let list = try await store.ghClient().listFiles()
+                await MainActor.run { files = list; loading = false }
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                await MainActor.run { errorText = msg; loading = false }
+            }
+        }
+    }
+}
+
+// MARK: - GitHub 单文件（AI 改 + 提交）
+struct GitHubFileView: View {
+    @ObservedObject var store: ChatStore
+    let path: String
+    @State private var content = ""
+    @State private var sha: String?
+    @State private var instruction = ""
+    @State private var loading = true
+    @State private var busy = false
+    @State private var status: String?
+    @State private var errorText: String?
+
+    private var title: String {
+        path.split(separator: "/").last.map { String($0) } ?? path
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let e = errorText {
+                Text(e).font(.caption).foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8).background(Color.red.opacity(0.08))
+            }
+            if loading {
+                ProgressView("加载中…").padding()
+            } else {
+                TextEditor(text: $content)
+                    .font(.system(.caption, design: .monospaced))
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 8) {
+                if let s = status { Text(s).font(.caption).foregroundColor(.secondary) }
+                HStack(spacing: 8) {
+                    TextField("让 AI 怎么改（如：修复输入框无反应）", text: $instruction)
+                        .textFieldStyle(.roundedBorder)
+                    Button(busy ? "处理中…" : "AI 修改") { aiModify() }
+                        .disabled(busy || instruction.isEmpty)
+                }
+                Button(busy ? "提交中…" : "提交到仓库") { commit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(busy || loading)
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(10)
+            .background(.ultraThinMaterial)
+        }
+        .onAppear(perform: loadFile)
+    }
+
+    private func loadFile() {
+        loading = true
+        errorText = nil
+        Task {
+            do {
+                let (c, s) = try await store.ghClient().getFile(path: path)
+                await MainActor.run { content = c; sha = s; loading = false }
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                await MainActor.run { errorText = msg; loading = false }
+            }
+        }
+    }
+
+    private func aiModify() {
+        busy = true
+        status = "AI 修改中…"
+        errorText = nil
+        Task {
+            let (newContent, err) = await store.modifyFileWithAI(fileName: path, current: content, instruction: instruction)
+            await MainActor.run {
+                if let nc = newContent, !nc.isEmpty {
+                    content = nc
+                    status = "已生成修改，确认后点『提交到仓库』"
+                } else {
+                    errorText = err ?? "AI 未返回内容"
+                    status = nil
+                }
+                busy = false
+            }
+        }
+    }
+
+    private func commit() {
+        busy = true
+        status = "提交中…"
+        errorText = nil
+        Task {
+            do {
+                try await store.ghClient().putFile(path: path, content: content, sha: sha, message: "更新 \(path)")
+                let (_, s) = try await store.ghClient().getFile(path: path)
+                await MainActor.run { sha = s; status = "已提交到分支 \(store.ghBranch)"; busy = false }
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                await MainActor.run { errorText = msg; status = nil; busy = false }
             }
         }
     }
