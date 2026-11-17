@@ -38,6 +38,25 @@ struct Conversation: Identifiable, Codable {
     var title: String = "新对话"
     var messages: [ChatMessage] = []
     var updatedAt: Date = Date()
+    var providerID: UUID?
+    var apiID: UUID?
+    var model: String?
+}
+
+// 一个 API 配置（昵称 + key）。key 不写入 json，只存钥匙串。
+struct APIConfig: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var nickname: String = ""
+    var key: String = ""
+    enum CodingKeys: String, CodingKey { case id, nickname }
+}
+
+// 一个 AI 提供商（可含多个 API）
+struct AIProvider: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String = ""
+    var baseURL: String = ""
+    var apis: [APIConfig] = []
 }
 
 struct ChatRequestError: Error { let message: String }
@@ -134,12 +153,11 @@ enum FileClassifier {
 
 // MARK: - 钥匙串
 enum Keychain {
-    static let service = "com.colin.deepseekchat"
-    static func save(_ value: String, for key: String) {
+    static func save(_ value: String, for account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key
+            kSecAttrService as String: "com.colin.deepseekchat",
+            kSecAttrAccount as String: account
         ]
         SecItemDelete(query as CFDictionary)
         guard !value.isEmpty else { return }
@@ -148,11 +166,11 @@ enum Keychain {
         add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         SecItemAdd(add as CFDictionary, nil)
     }
-    static func read(_ key: String) -> String {
+    static func read(_ account: String) -> String {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key,
+            kSecAttrService as String: "com.colin.deepseekchat",
+            kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -168,60 +186,13 @@ enum Keychain {
 // MARK: - ZIP 解析
 enum ZipReader {
     static func extractText(from data: Data, maxTotal: Int = 150_000) -> String {
-        guard data.count > 22 else { return "" }
-        var eocd = -1
-        let minPos = max(0, data.count - 22 - 65535)
-        var i = data.count - 22
-        while i >= minPos {
-            if u32(data, i) == 0x06054b50 { eocd = i; break }
-            i -= 1
-        }
-        guard eocd >= 0 else { return "" }
-        let total = u16(data, eocd + 10)
-        let cdOffset = u32(data, eocd + 16)
-        guard cdOffset > 0, cdOffset < data.count else { return "" }
-        var pos = cdOffset
+        let entries = extractFiles(from: data, onlyExtensions: nil, maxEach: 5_000_000, maxTotal: maxTotal)
         var result = ""
-        var idx = 0
-        while idx < total, pos + 46 <= data.count {
-            guard u32(data, pos) == 0x02014b50 else { break }
-            let method = u16(data, pos + 10)
-            let compSize = u32(data, pos + 20)
-            let uncompSize = u32(data, pos + 24)
-            let nameLen = u16(data, pos + 28)
-            let extraLen = u16(data, pos + 30)
-            let commentLen = u16(data, pos + 32)
-            let localOff = u32(data, pos + 42)
-            guard pos + 46 + nameLen <= data.count else { break }
-            let name = String(data: data.subdata(in: pos + 46 ..< pos + 46 + nameLen), encoding: .utf8) ?? "file\(idx)"
-            if shouldInclude(name), localOff + 30 <= data.count {
-                let lnameLen = u16(data, localOff + 26)
-                let lextraLen = u16(data, localOff + 28)
-                let dataStart = localOff + 30 + lnameLen + lextraLen
-                if dataStart + compSize <= data.count, compSize > 0 {
-                    let comp = data.subdata(in: dataStart ..< dataStart + compSize)
-                    var fileData: Data? = nil
-                    if method == 0 {
-                        fileData = comp
-                    } else if method == 8 {
-                        fileData = inflate(comp, expected: min(uncompSize, 5_000_000))
-                    }
-                    if let fd = fileData, let text = decodeText(fd) {
-                        let clipped = String(text.prefix(60_000))
-                        let piece = "\n--- \(name) ---\n" + clipped + "\n"
-                        if result.count + piece.count <= maxTotal {
-                            result += piece
-                        } else {
-                            let remain = maxTotal - result.count
-                            if remain > 0 { result += String(piece.prefix(remain)) }
-                            break
-                        }
-                    }
-                }
-            }
-            pos += 46 + nameLen + extraLen + commentLen
-            idx += 1
-            if result.count >= maxTotal { break }
+        for (name, d) in entries {
+            guard shouldInclude(name), let text = decodeText(d) else { continue }
+            let piece = "\n--- \(name) ---\n" + String(text.prefix(60_000)) + "\n"
+            if result.count + piece.count <= maxTotal { result += piece }
+            else { let remain = maxTotal - result.count; if remain > 0 { result += String(piece.prefix(remain)) }; break }
         }
         return result
     }
@@ -244,33 +215,6 @@ enum ZipReader {
         return nil
     }
 
-    private static func inflate(_ input: Data, expected: Int) -> Data? {
-        let inputCount = input.count
-        let capacity = max(expected, inputCount * 4, 4096)
-        var dst = Data(count: capacity)
-        let n = dst.withUnsafeMutableBytes { (dptr: UnsafeMutableRawBufferPointer) -> Int in
-            input.withUnsafeBytes { (sptr: UnsafeRawBufferPointer) -> Int in
-                guard let dbase = dptr.bindMemory(to: UInt8.self).baseAddress,
-                      let sbase = sptr.bindMemory(to: UInt8.self).baseAddress else { return 0 }
-                return compression_decode_buffer(dbase, capacity, sbase, inputCount, nil, COMPRESSION_ZLIB)
-            }
-        }
-        if n <= 0 { return nil }
-        return Data(dst.prefix(n))
-    }
-
-    private static func u16(_ d: Data, _ off: Int) -> Int {
-        let i = d.startIndex + off
-        guard i + 1 < d.endIndex else { return 0 }
-        return Int(d[i]) | (Int(d[i + 1]) << 8)
-    }
-    private static func u32(_ d: Data, _ off: Int) -> Int {
-        let i = d.startIndex + off
-        guard i + 3 < d.endIndex else { return 0 }
-        return Int(d[i]) | (Int(d[i + 1]) << 8) | (Int(d[i + 2]) << 16) | (Int(d[i + 3]) << 24)
-    }
-
-    // 解出 zip 中的文件原始数据（可按扩展名过滤），用于导入 Chatbox 等导出的 ZIP
     static func extractFiles(from data: Data, onlyExtensions: Set<String>?, maxEach: Int = 30_000_000, maxTotal: Int = 80_000_000) -> [(String, Data)] {
         var out: [(String, Data)] = []
         guard data.count > 22 else { return out }
@@ -322,9 +266,35 @@ enum ZipReader {
         }
         return out
     }
+
+    private static func inflate(_ input: Data, expected: Int) -> Data? {
+        let inputCount = input.count
+        let capacity = max(expected, inputCount * 4, 4096)
+        var dst = Data(count: capacity)
+        let n = dst.withUnsafeMutableBytes { (dptr: UnsafeMutableRawBufferPointer) -> Int in
+            input.withUnsafeBytes { (sptr: UnsafeRawBufferPointer) -> Int in
+                guard let dbase = dptr.bindMemory(to: UInt8.self).baseAddress,
+                      let sbase = sptr.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                return compression_decode_buffer(dbase, capacity, sbase, inputCount, nil, COMPRESSION_ZLIB)
+            }
+        }
+        if n <= 0 { return nil }
+        return Data(dst.prefix(n))
+    }
+
+    private static func u16(_ d: Data, _ off: Int) -> Int {
+        let i = d.startIndex + off
+        guard i + 1 < d.endIndex else { return 0 }
+        return Int(d[i]) | (Int(d[i + 1]) << 8)
+    }
+    private static func u32(_ d: Data, _ off: Int) -> Int {
+        let i = d.startIndex + off
+        guard i + 3 < d.endIndex else { return 0 }
+        return Int(d[i]) | (Int(d[i + 1]) << 8) | (Int(d[i + 2]) << 16) | (Int(d[i + 3]) << 24)
+    }
 }
 
-// MARK: - 导入解析（兼容 Chatbox / 通用 JSON）
+// MARK: - 导入解析（兼容 Chatbox / 通用 JSON / ZIP）
 enum ConversationImporter {
     private static func isZipData(_ d: Data) -> Bool {
         guard d.count >= 4 else { return false }
@@ -384,9 +354,7 @@ enum ConversationImporter {
     private static func parseSessionArray(_ arr: [Any]) -> [Conversation] {
         var out: [Conversation] = []
         for item in arr {
-            if let dict = item as? [String: Any], let c = parseSession(dict) {
-                out.append(c)
-            }
+            if let dict = item as? [String: Any], let c = parseSession(dict) { out.append(c) }
         }
         return out
     }
@@ -436,22 +404,33 @@ enum ConversationImporter {
     }
 }
 
-// MARK: - DeepSeek 网络客户端
-final class DeepSeekClient {
-    let apiBase: String
+// MARK: - 网络客户端（OpenAI 兼容，可指向任意提供商）
+final class ChatClient {
+    let baseURL: String
     let apiKey: String
     let model: String
     let webSearch: Bool
-    init(apiBase: String, apiKey: String, model: String, webSearch: Bool) {
-        self.apiBase = apiBase
+    let isDeepSeek: Bool
+    init(baseURL: String, apiKey: String, model: String, webSearch: Bool, isDeepSeek: Bool) {
+        self.baseURL = baseURL
         self.apiKey = apiKey
         self.model = model
         self.webSearch = webSearch
+        self.isDeepSeek = isDeepSeek
     }
 
     func cleanedBase() -> String {
-        apiBase.trimmingCharacters(in: .whitespacesAndNewlines)
+        baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    func fetchModels() async throws -> [ModelInfo] {
+        guard let url = URL(string: cleanedBase() + "/models") else { return [] }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let (data, _) = try await URLSession.shared.data(for: req)
+        let decoded = try JSONDecoder().decode(ModelsResponse.self, from: data)
+        return decoded.data
     }
 
     func uploadFile(_ f: PickedFile) async throws -> String {
@@ -519,7 +498,7 @@ final class DeepSeekClient {
                         "stream": true,
                         "messages": encodeMessages(messages)
                     ]
-                    if webSearch {
+                    if webSearch && isDeepSeek {
                         let tools: [[String: Any]] = [
                             ["type": "deepseek_web_search"],
                             ["type": "deepseek_read_url"]
@@ -589,26 +568,19 @@ final class ChatStore: ObservableObject {
     @Published var errorText: String?
     @Published var statusText: String?
 
-    @Published var apiBase: String = "https://api.deepseek.com"
-    @Published var models: [ModelInfo] = [
-        ModelInfo(id: "deepseek-chat", name: "deepseek-chat", owned_by: nil, input_modalities: ["text"]),
-        ModelInfo(id: "deepseek-reasoner", name: "deepseek-reasoner", owned_by: nil, input_modalities: ["text"])
-    ]
-    @Published var selectedModel: String = "deepseek-chat"
-    @Published var webSearch: Bool = false
-    var apiKey: String = ""
+    @Published var providers: [AIProvider] = []
+    @Published var providerModels: [UUID: [ModelInfo]] = [:]
 
-    private var fileURL: URL {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return dir.appendingPathComponent("conversations.json")
+    private var convURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("conversations.json")
+    }
+    private var provURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("providers.json")
     }
 
     init() {
-        apiBase = UserDefaults.standard.string(forKey: "apiBase") ?? "https://api.deepseek.com"
-        selectedModel = UserDefaults.standard.string(forKey: "model") ?? "deepseek-chat"
-        webSearch = UserDefaults.standard.bool(forKey: "webSearch")
-        apiKey = Keychain.read("apiKey")
-        load()
+        loadProviders()
+        loadConversations()
     }
 
     var currentIndex: Int? { conversations.firstIndex { $0.id == currentID } }
@@ -618,11 +590,103 @@ final class ChatStore: ObservableObject {
     }
     var currentTitle: String {
         if let i = currentIndex { return conversations[i].title }
-        return "我的 DeepSeek"
+        return "我的 AI"
     }
 
-    func load() {
-        if let data = try? Data(contentsOf: fileURL),
+    func selection() -> (AIProvider?, APIConfig?, String?) {
+        let conv = currentIndex.map { conversations[$0] }
+        let provider = providers.first { $0.id == conv?.providerID } ?? providers.first
+        guard let p = provider else { return (nil, nil, nil) }
+        let api = p.apis.first { $0.id == conv?.apiID } ?? p.apis.first
+        var model = conv?.model
+        if model == nil || model!.isEmpty {
+            model = providerModels[p.id]?.first?.id
+            if model == nil, p.baseURL.lowercased().contains("deepseek") { model = "deepseek-chat" }
+        }
+        return (p, api, model)
+    }
+
+    var selectionSummary: String {
+        let (p, a, m) = selection()
+        let pn = p?.name ?? "未配置"
+        let an = (a?.nickname.isEmpty == false ? a!.nickname : "默认")
+        let mn = (m?.isEmpty == false ? m! : "选择模型")
+        return "\(pn) · \(an) · \(mn)"
+    }
+
+    // MARK: 持久化 - 提供商
+    func loadProviders() {
+        if let data = try? Data(contentsOf: provURL),
+           let decoded = try? JSONDecoder().decode([AIProvider].self, from: data),
+           !decoded.isEmpty {
+            providers = decoded
+        } else {
+            providers = [AIProvider(name: "DeepSeek", baseURL: "https://api.deepseek.com", apis: [])]
+        }
+        for i in providers.indices {
+            for j in providers[i].apis.indices {
+                providers[i].apis[j].key = Keychain.read("api_\(providers[i].apis[j].id.uuidString)")
+            }
+        }
+        if providers[0].apis.isEmpty {
+            let old = Keychain.read("apiKey")
+            if !old.isEmpty {
+                let cfg = APIConfig(nickname: "默认", key: old)
+                providers[0].apis.append(cfg)
+                Keychain.save(old, for: "api_\(cfg.id.uuidString)")
+                persistProviders()
+            }
+        }
+    }
+
+    func persistProviders() {
+        for p in providers {
+            for a in p.apis {
+                Keychain.save(a.key, for: "api_\(a.id.uuidString)")
+            }
+        }
+        if let data = try? JSONEncoder().encode(providers) {
+            try? data.write(to: provURL)
+        }
+    }
+
+    func addProvider(name: String, baseURL: String) {
+        providers.append(AIProvider(name: name, baseURL: baseURL, apis: []))
+        persistProviders()
+    }
+
+    func updateProvider(_ id: UUID, name: String, baseURL: String, apis: [APIConfig]) {
+        if let i = providers.firstIndex(where: { $0.id == id }) {
+            providers[i].name = name
+            providers[i].baseURL = baseURL
+            providers[i].apis = apis
+            persistProviders()
+        }
+    }
+
+    func deleteProvider(_ id: UUID) {
+        providers.removeAll { $0.id == id }
+        if providers.isEmpty {
+            providers = [AIProvider(name: "DeepSeek", baseURL: "https://api.deepseek.com", apis: [])]
+        }
+        persistProviders()
+    }
+
+    func models(for provider: AIProvider) -> [ModelInfo] {
+        providerModels[provider.id] ?? []
+    }
+
+    func fetchModels(provider: AIProvider, apiKey: String) async {
+        let client = ChatClient(baseURL: provider.baseURL, apiKey: apiKey, model: "", webSearch: false, isDeepSeek: false)
+        do {
+            let list = try await client.fetchModels()
+            if !list.isEmpty { providerModels[provider.id] = list }
+        } catch {}
+    }
+
+    // MARK: 持久化 - 会话
+    func loadConversations() {
+        if let data = try? Data(contentsOf: convURL),
            let decoded = try? JSONDecoder().decode([Conversation].self, from: data),
            !decoded.isEmpty {
             conversations = decoded
@@ -641,7 +705,7 @@ final class ChatStore: ObservableObject {
 
     func persist() {
         if let data = try? JSONEncoder().encode(conversations) {
-            try? data.write(to: fileURL)
+            try? data.write(to: convURL)
         }
         UserDefaults.standard.set(currentID.uuidString, forKey: "currentID")
     }
@@ -681,6 +745,14 @@ final class ChatStore: ObservableObject {
         conversations[i] = conv
         errorText = nil
         statusText = nil
+        persist()
+    }
+
+    func setSelection(providerID: UUID?, apiID: UUID?, model: String?) {
+        guard let i = currentIndex else { return }
+        conversations[i].providerID = providerID
+        conversations[i].apiID = apiID
+        conversations[i].model = model
         persist()
     }
 
@@ -724,9 +796,7 @@ final class ChatStore: ObservableObject {
         do {
             try json.data(using: .utf8)?.write(to: url)
             return url
-        } catch {
-            return nil
-        }
+        } catch { return nil }
     }
 
     @discardableResult
@@ -740,60 +810,27 @@ final class ChatStore: ObservableObject {
         return convs.count
     }
 
-    // 设置
-    func saveSettings(apiKey: String, apiBase: String, model: String, webSearch: Bool) {
-        self.apiKey = apiKey
-        self.apiBase = apiBase
-        self.selectedModel = model
-        self.webSearch = webSearch
-        Keychain.save(apiKey, for: "apiKey")
-        UserDefaults.standard.set(apiBase, forKey: "apiBase")
-        UserDefaults.standard.set(model, forKey: "model")
-        UserDefaults.standard.set(webSearch, forKey: "webSearch")
-    }
-
-    func toggleWebSearch() {
-        webSearch.toggle()
-        UserDefaults.standard.set(webSearch, forKey: "webSearch")
-    }
-
-    func loadModels() async {
-        guard !apiKey.isEmpty else { return }
-        let base = apiBase.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: base + "/models") else { return }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            let decoded = try JSONDecoder().decode(ModelsResponse.self, from: data)
-            if !decoded.data.isEmpty {
-                models = decoded.data
-                if !models.contains(where: { $0.id == selectedModel }) {
-                    selectedModel = models.first!.id
-                    UserDefaults.standard.set(selectedModel, forKey: "model")
-                }
-                if errorText?.hasPrefix("模型列表获取失败") == true { errorText = nil }
-            }
-        } catch {
-            if errorText == nil {
-                errorText = "模型列表获取失败：\(error.localizedDescription)"
-            }
-        }
-    }
-
-    // 发送
+    // MARK: 发送
     func send(_ text: String, files: [PickedFile]) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !files.isEmpty else { return }
         guard !isSending else { return }
-        guard !apiKey.isEmpty else {
-            errorText = "请先在设置里填写 API Key"
+        let (providerOpt, apiOpt, modelOpt) = selection()
+        guard let provider = providerOpt else { errorText = "请先在设置里添加 AI 提供商"; return }
+        guard let api = apiOpt else { errorText = "请先在「\(provider.name)」下添加 API"; return }
+        guard let model = modelOpt, !model.isEmpty else { errorText = "请先为当前对话选择一个模型"; return }
+        guard !api.key.isEmpty else { errorText = "该 API 未填写 Key"; return }
+        let isDeepSeek = provider.baseURL.lowercased().contains("deepseek")
+        let nonZip = files.filter { !$0.isZip }
+        if !nonZip.isEmpty && !isDeepSeek {
+            errorText = "当前 AI（\(provider.name)）暂不支持上传文件，请改用 DeepSeek 或改发文字"
             return
         }
         errorText = nil
         statusText = nil
         isSending = true
+
+        let client = ChatClient(baseURL: provider.baseURL, apiKey: api.key, model: model, webSearch: isDeepSeek, isDeepSeek: isDeepSeek)
 
         var meta: [MessageAttachment] = []
         var zipText = ""
@@ -803,10 +840,9 @@ final class ChatStore: ObservableObject {
                 let t = ZipReader.extractText(from: f.data)
                 zipText += t.isEmpty ? "\n--- \(f.filename)：未找到可读文本 ---\n" : t
             }
-            for f in files where !f.isZip {
+            for f in nonZip {
                 statusText = "正在上传 \(f.filename)…"
-                let uploader = DeepSeekClient(apiBase: apiBase, apiKey: apiKey, model: selectedModel, webSearch: false)
-                let fid = try await uploader.uploadFile(f)
+                let fid = try await client.uploadFile(f)
                 let thumb = f.isImage ? FileClassifier.thumbnail(from: f.data) : nil
                 meta.append(MessageAttachment(filename: f.filename, isImage: f.isImage, fileId: fid, thumbBase64: thumb))
             }
@@ -829,16 +865,11 @@ final class ChatStore: ObservableObject {
         appendToCurrent(ChatMessage(role: .assistant, content: "", attachments: []))
         let convo = Array(messages.prefix(assistantIndex))
 
-        let needsFile = !meta.isEmpty
-        let effectiveModel = (needsFile || webSearch) ? "deepseek-flash" : selectedModel
-        let client = DeepSeekClient(apiBase: apiBase, apiKey: apiKey, model: effectiveModel, webSearch: webSearch)
         do {
             for try await ev in client.stream(messages: convo) {
                 switch ev {
-                case .text(let t):
-                    setContent(assistantIndex, t)
-                case .status(let s):
-                    statusText = s.isEmpty ? nil : s
+                case .text(let t): setContent(assistantIndex, t)
+                case .status(let s): statusText = s.isEmpty ? nil : s
                 }
             }
         } catch {
@@ -857,7 +888,7 @@ final class ChatStore: ObservableObject {
     }
 }
 
-// MARK: - 系统分享面板（导出文件用）
+// MARK: - 系统分享面板
 struct ActivityView: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -871,15 +902,10 @@ struct AttachmentChip: View {
     let att: MessageAttachment
     var body: some View {
         if att.isImage, let b64 = att.thumbBase64, let d = Data(base64Encoded: b64), let ui = UIImage(data: d) {
-            Image(uiImage: ui)
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: 180)
+            Image(uiImage: ui).resizable().scaledToFit().frame(maxWidth: 180)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
         } else {
-            Label(att.filename, systemImage: "doc.fill")
-                .font(.caption)
-                .padding(8)
+            Label(att.filename, systemImage: "doc.fill").font(.caption).padding(8)
                 .background(Color(UIColor.tertiarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
         }
@@ -894,25 +920,18 @@ struct MessageRow: View {
         HStack(alignment: .top, spacing: 8) {
             if isUser { Spacer(minLength: 40) }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
-                ForEach(message.attachments) { att in
-                    AttachmentChip(att: att)
-                }
+                ForEach(message.attachments) { att in AttachmentChip(att: att) }
                 if !message.content.isEmpty {
                     Text(message.content)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
+                        .padding(.horizontal, 12).padding(.vertical, 9)
                         .background(isUser ? Color.accentColor.opacity(0.22) : Color(UIColor.secondarySystemBackground))
                         .foregroundColor(.primary)
                         .clipShape(RoundedRectangle(cornerRadius: 16))
                         .textSelection(.enabled)
                 } else if message.attachments.isEmpty {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                        Text("思考中…").font(.footnote).foregroundColor(.secondary)
-                    }
-                    .padding(10)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    HStack(spacing: 6) { ProgressView(); Text("思考中…").font(.footnote).foregroundColor(.secondary) }
+                        .padding(10).background(Color(UIColor.secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
                 }
             }
             if !isUser { Spacer(minLength: 40) }
@@ -926,6 +945,7 @@ struct ContentView: View {
     @State private var input = ""
     @State private var showSettings = false
     @State private var showConvList = false
+    @State private var showAI = false
     @State private var picked: [PickedFile] = []
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var showPhotos = false
@@ -940,56 +960,45 @@ struct ContentView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(store.messages) { m in
-                                MessageRow(message: m).id(m.id)
-                            }
-                            if let s = store.statusText {
-                                Text(s).font(.footnote).foregroundColor(.secondary)
-                            }
+                            ForEach(store.messages) { m in MessageRow(message: m).id(m.id) }
+                            if let s = store.statusText { Text(s).font(.footnote).foregroundColor(.secondary) }
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 14)
+                        .padding(.horizontal, 12).padding(.vertical, 14)
                     }
                     .scrollDismissesKeyboard(.interactively)
                     .onTapGesture { inputFocused = false }
                     .onChange(of: store.messages.count) { _ in
-                        if let last = store.messages.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                        }
+                        if let last = store.messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
                     }
                 }
 
                 if let err = store.errorText {
-                    Text(err)
-                        .font(.footnote)
-                        .foregroundColor(.red)
+                    Text(err).font(.footnote).foregroundColor(.red)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
+                        .padding(.horizontal, 12).padding(.vertical, 4)
                         .background(Color.red.opacity(0.08))
                 }
 
                 Divider()
 
-                // 附件区（一眼可见的按钮）
+                Button { showAI = true } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "cpu")
+                        Text(store.selectionSummary).font(.footnote).lineLimit(1)
+                        Image(systemName: "chevron.down").font(.caption2)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Color(UIColor.secondarySystemBackground))
+                }
+                .foregroundColor(.primary)
+
                 HStack(spacing: 10) {
-                    Button { showPhotos = true } label: {
-                        Label("照片", systemImage: "photo")
-                            .font(.subheadline)
-                    }
-                    Button { showFiles = true } label: {
-                        Label("文件", systemImage: "folder")
-                            .font(.subheadline)
-                    }
-                    Button { store.toggleWebSearch() } label: {
-                        Label("联网", systemImage: "globe")
-                            .font(.subheadline)
-                    }
-                    .tint(store.webSearch ? Color.green : Color.gray)
+                    Button { showPhotos = true } label: { Label("照片", systemImage: "photo").font(.subheadline) }
+                    Button { showFiles = true } label: { Label("文件", systemImage: "folder").font(.subheadline) }
                     Spacer()
                 }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
+                .padding(.horizontal, 12).padding(.top, 8)
 
                 if !picked.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -1003,47 +1012,36 @@ struct ContentView: View {
                                         Image(systemName: pf.isZip ? "doc.zipper" : "doc.fill")
                                     }
                                     Text(pf.filename).font(.caption).lineLimit(1)
-                                    Button {
-                                        picked.removeAll { $0.id == pf.id }
-                                    } label: {
+                                    Button { picked.removeAll { $0.id == pf.id } } label: {
                                         Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
                                     }
                                 }
-                                .padding(6)
-                                .background(Color(UIColor.secondarySystemBackground))
+                                .padding(6).background(Color(UIColor.secondarySystemBackground))
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                             }
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.top, 6)
+                        .padding(.horizontal, 12).padding(.top, 6)
                     }
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
                     TextField("输入消息…", text: $input, axis: .vertical)
-                        .focused($inputFocused)
-                        .lineLimit(1...5)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 9)
+                        .focused($inputFocused).lineLimit(1...5)
+                        .padding(.horizontal, 10).padding(.vertical, 9)
                         .background(Color(UIColor.secondarySystemBackground))
                         .clipShape(RoundedRectangle(cornerRadius: 18))
 
                     Button {
-                        let t = input
-                        let files = picked
-                        input = ""
-                        picked = []
-                        inputFocused = false
+                        let t = input; let files = picked
+                        input = ""; picked = []; inputFocused = false
                         Task { await store.send(t, files: files) }
                     } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 30))
+                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
                             .foregroundColor(canSend ? .accentColor : .gray)
                     }
                     .disabled(!canSend)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 10).padding(.vertical, 8)
                 .background(Color(UIColor.systemBackground))
             }
             .navigationTitle(store.currentTitle)
@@ -1055,13 +1053,8 @@ struct ContentView: View {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button {
                         let current = store.currentIndex.map { [store.conversations[$0]] } ?? store.conversations
-                        if let url = store.writeTempExport(current) {
-                            exportItems = [url]
-                            showExport = true
-                        }
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
-                    }
+                        if let url = store.writeTempExport(current) { exportItems = [url]; showExport = true }
+                    } label: { Image(systemName: "square.and.arrow.up") }
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
                 ToolbarItemGroup(placement: .keyboard) {
@@ -1071,6 +1064,7 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings) { SettingsView(store: store) }
             .sheet(isPresented: $showConvList) { ConversationListView(store: store) }
+            .sheet(isPresented: $showAI) { AISelectorView(store: store) }
             .sheet(isPresented: $showExport) { ActivityView(items: exportItems) }
             .photosPicker(isPresented: $showPhotos, selection: $photoItems, maxSelectionCount: 0, matching: .images)
             .onChange(of: photoItems) { items in
@@ -1078,15 +1072,11 @@ struct ContentView: View {
                 Task {
                     var arr: [PickedFile] = []
                     for it in items {
-                        if let data = try? await it.loadTransferable(type: Data.self),
-                           let pf = FileClassifier.image(from: data) {
+                        if let data = try? await it.loadTransferable(type: Data.self), let pf = FileClassifier.image(from: data) {
                             arr.append(pf)
                         }
                     }
-                    await MainActor.run {
-                        picked.append(contentsOf: arr)
-                        photoItems = []
-                    }
+                    await MainActor.run { picked.append(contentsOf: arr); photoItems = [] }
                 }
             }
             .fileImporter(isPresented: $showFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
@@ -1103,12 +1093,103 @@ struct ContentView: View {
                     store.errorText = "选取文件失败：\(e.localizedDescription)"
                 }
             }
-            .task { await store.loadModels() }
         }
     }
 
     private var canSend: Bool {
         !store.isSending && (!input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !picked.isEmpty)
+    }
+}
+
+// MARK: - AI 选择器（每个对话）
+struct AISelectorView: View {
+    @ObservedObject var store: ChatStore
+    @Environment(\.dismiss) var dismiss
+    @State private var providerID: UUID?
+    @State private var apiID: UUID?
+    @State private var model: String = ""
+    @State private var loading = false
+
+    private var provider: AIProvider? { store.providers.first { $0.id == providerID } }
+    private var apiKey: String { provider?.apis.first { $0.id == apiID }?.key ?? "" }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("AI 提供商")) {
+                    if store.providers.isEmpty {
+                        Text("请到设置里添加 AI").foregroundColor(.secondary)
+                    }
+                    Picker("提供商", selection: $providerID) {
+                        ForEach(store.providers) { p in Text(p.name).tag(Optional(p.id)) }
+                    }
+                    .onChange(of: providerID) { _ in
+                        apiID = provider?.apis.first?.id
+                        model = ""
+                        loadModels()
+                    }
+                }
+                Section(header: Text("API（昵称）")) {
+                    if let p = provider, !p.apis.isEmpty {
+                        Picker("API", selection: $apiID) {
+                            ForEach(p.apis) { a in
+                                Text(a.nickname.isEmpty ? "未命名" : a.nickname).tag(Optional(a.id))
+                            }
+                        }
+                        .onChange(of: apiID) { _ in loadModels() }
+                    } else {
+                        Text("该 AI 还没有 API，请到设置里添加").foregroundColor(.secondary)
+                    }
+                }
+                Section(header: Text("模型")) {
+                    TextField("模型名称", text: $model)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    Button(loading ? "刷新中…" : "刷新模型列表") { loadModels() }
+                        .disabled(loading || provider == nil)
+                    let list = provider.map { store.models(for: $0) } ?? []
+                    if !list.isEmpty {
+                        ForEach(list) { m in
+                            Button { model = m.id } label: {
+                                HStack { Text(m.display); Spacer()
+                                    if model == m.id { Image(systemName: "checkmark").foregroundColor(.accentColor) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("选择 AI")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("确定") {
+                        store.setSelection(providerID: providerID, apiID: apiID, model: model.isEmpty ? nil : model)
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .navigationBarLeading) { Button("取消") { dismiss() } }
+            }
+            .onAppear {
+                let (p, a, m) = store.selection()
+                providerID = p?.id ?? store.providers.first?.id
+                apiID = a?.id ?? provider?.apis.first?.id
+                model = m ?? ""
+            }
+        }
+    }
+
+    private func loadModels() {
+        guard let p = provider else { return }
+        let key = apiKey
+        guard !key.isEmpty else { return }
+        loading = true
+        Task {
+            await store.fetchModels(provider: p, apiKey: key)
+            await MainActor.run {
+                if model.isEmpty, let first = store.models(for: p).first?.id { model = first }
+                loading = false
+            }
+        }
     }
 }
 
@@ -1124,62 +1205,35 @@ struct ConversationListView: View {
         NavigationView {
             List {
                 Section {
-                    Button {
-                        store.newConversation()
-                        dismiss()
-                    } label: {
+                    Button { store.newConversation(); dismiss() } label: {
                         Label("新建对话", systemImage: "plus.circle.fill")
                     }
                 }
-
                 Section(header: Text("导入 / 导出")) {
-                    Button {
-                        showImport = true
-                    } label: {
+                    Button { showImport = true } label: {
                         Label("导入对话（兼容 Chatbox 导出 ZIP/JSON）", systemImage: "square.and.arrow.down")
                     }
                     Button {
-                        if let url = store.writeTempExport(store.conversations) {
-                            exportItems = [url]
-                            showExport = true
-                        }
-                    } label: {
-                        Label("导出全部对话（JSON）", systemImage: "square.and.arrow.up")
-                    }
+                        if let url = store.writeTempExport(store.conversations) { exportItems = [url]; showExport = true }
+                    } label: { Label("导出全部对话（JSON）", systemImage: "square.and.arrow.up") }
                 }
-
                 Section(header: Text("历史对话")) {
                     ForEach(store.conversations) { conv in
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(conv.title).font(.body).lineLimit(1)
-                                Text("\(conv.messages.count) 条消息")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
+                                Text("\(conv.messages.count) 条消息").font(.caption).foregroundColor(.secondary)
                             }
                             Spacer()
-                            if conv.id == store.currentID {
-                                Image(systemName: "checkmark").foregroundColor(.accentColor)
-                            }
+                            if conv.id == store.currentID { Image(systemName: "checkmark").foregroundColor(.accentColor) }
                         }
                         .contentShape(Rectangle())
-                        .onTapGesture {
-                            store.select(conv.id)
-                            dismiss()
-                        }
+                        .onTapGesture { store.select(conv.id); dismiss() }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button(role: .destructive) {
-                                store.delete(conv.id)
-                            } label: {
-                                Label("删除", systemImage: "trash")
-                            }
+                            Button(role: .destructive) { store.delete(conv.id) } label: { Label("删除", systemImage: "trash") }
                         }
                         .contextMenu {
-                            Button(role: .destructive) {
-                                store.delete(conv.id)
-                            } label: {
-                                Label("删除对话", systemImage: "trash")
-                            }
+                            Button(role: .destructive) { store.delete(conv.id) } label: { Label("删除对话", systemImage: "trash") }
                         }
                     }
                     .onDelete { idx in
@@ -1191,25 +1245,17 @@ struct ConversationListView: View {
             .navigationTitle("对话")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    EditButton()
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") { dismiss() }
-                }
+                ToolbarItem(placement: .navigationBarLeading) { EditButton() }
+                ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
             }
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.zip, .json, .text, .data], allowsMultipleSelection: false) { result in
                 switch result {
                 case .success(let urls):
                     if let url = urls.first {
                         let n = store.importConversations(from: url)
-                        if n > 0 {
-                            dismiss()
-                        } else if n == 0 {
-                            store.errorText = "该文件没有可识别的对话"
-                        } else {
-                            store.errorText = "无法读取该文件"
-                        }
+                        if n > 0 { dismiss() }
+                        else if n == 0 { store.errorText = "该文件没有可识别的对话" }
+                        else { store.errorText = "无法读取该文件" }
                     }
                 case .failure(let e):
                     store.errorText = "导入失败：\(e.localizedDescription)"
@@ -1224,58 +1270,26 @@ struct ConversationListView: View {
 struct SettingsView: View {
     @ObservedObject var store: ChatStore
     @Environment(\.dismiss) var dismiss
-    @State private var key = ""
-    @State private var base = ""
-    @State private var model = ""
-    @State private var webSearch = false
-    @State private var loading = false
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("API Key（只存本机钥匙串）")) {
-                    SecureField("sk-...", text: $key)
-                }
-                Section(header: Text("API 地址")) {
-                    TextField("https://api.deepseek.com", text: $base)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                }
-                Section(header: Text("模型（来自官方 /models 实时拉取）")) {
-                    if store.models.isEmpty {
-                        Text("暂无，请点下方刷新").foregroundColor(.secondary)
+                Section(header: Text("AI 提供商 / API")) {
+                    NavigationLink {
+                        ProvidersView(store: store)
+                    } label: {
+                        Label("管理 AI 与 API（可加多个、起昵称）", systemImage: "server.rack")
                     }
-                    Picker("模型", selection: $model) {
-                        ForEach(store.models) { m in
-                            Text(m.display).tag(m.id)
+                    ForEach(store.providers) { p in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(p.name).font(.subheadline)
+                            Text("\(p.apis.count) 个 API · \(p.baseURL)").font(.caption).foregroundColor(.secondary).lineLimit(1)
                         }
                     }
-                    Button(loading ? "刷新中…" : "刷新模型列表") {
-                        Task {
-                            loading = true
-                            store.saveSettings(apiKey: key,
-                                               apiBase: base.isEmpty ? "https://api.deepseek.com" : base,
-                                               model: model.isEmpty ? store.selectedModel : model,
-                                               webSearch: webSearch)
-                            await store.loadModels()
-                            if !store.models.contains(where: { $0.id == model }) {
-                                model = store.selectedModel
-                            }
-                            loading = false
-                        }
-                    }
-                    .disabled(key.isEmpty || loading)
                 }
-                Section(header: Text("联网搜索")) {
-                    Toggle("开启联网搜索", isOn: $webSearch)
-                    Text("开启后使用 deepseek-flash 模型联网检索并给出引用。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Section(header: Text("文件 / 压缩包说明")) {
-                    Text("可一次选多个文件或照片。发送文件/图片/ZIP 时会自动改用 deepseek-flash 模型。ZIP 会在本机解压、抽取其中文本文件内容再交给模型。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                Section(header: Text("说明")) {
+                    Text("每个对话可在聊天页顶部单独选择用哪个 AI / 哪个 API / 哪个模型。文件、ZIP、联网搜索为 DeepSeek 专属能力；其他 AI 仅支持文字与 ZIP 文本提取。")
+                        .font(.caption).foregroundColor(.secondary)
                 }
                 Section {
                     Button("清空当前对话", role: .destructive) { store.clearCurrent() }
@@ -1283,30 +1297,105 @@ struct SettingsView: View {
             }
             .navigationTitle("设置")
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("保存") {
-                        store.saveSettings(apiKey: key,
-                                           apiBase: base.isEmpty ? "https://api.deepseek.com" : base,
-                                           model: model.isEmpty ? store.selectedModel : model,
-                                           webSearch: webSearch)
-                        dismiss()
+                ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
+            }
+        }
+    }
+}
+
+// MARK: - 提供商管理
+struct ProvidersView: View {
+    @ObservedObject var store: ChatStore
+    @State private var showAdd = false
+    @State private var newName = ""
+    @State private var newBase = ""
+
+    var body: some View {
+        List {
+            Section {
+                Button {
+                    newName = ""; newBase = ""; showAdd = true
+                } label: { Label("添加 AI 提供商", systemImage: "plus.circle.fill") }
+            }
+            Section(header: Text("AI 提供商")) {
+                ForEach(store.providers) { p in
+                    NavigationLink {
+                        ProviderEditorView(store: store, providerID: p.id)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(p.name).font(.body)
+                            Text("\(p.apis.count) 个 API · \(p.baseURL)").font(.caption).foregroundColor(.secondary).lineLimit(1)
+                        }
                     }
                 }
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("取消") { dismiss() }
+                .onDelete { idx in
+                    let ids = idx.map { store.providers[$0].id }
+                    for id in ids { store.deleteProvider(id) }
                 }
             }
-            .onAppear {
-                key = store.apiKey
-                base = store.apiBase
-                model = store.selectedModel
-                webSearch = store.webSearch
-                Task {
-                    await store.loadModels()
-                    if !store.models.contains(where: { $0.id == model }) {
-                        model = store.selectedModel
+        }
+        .navigationTitle("AI 提供商")
+        .alert("添加 AI 提供商", isPresented: $showAdd) {
+            TextField("名称，如 OpenAI / 硅基流动", text: $newName)
+            TextField("接口地址，如 https://api.openai.com/v1", text: $newBase)
+            Button("添加") { store.addProvider(name: newName.isEmpty ? "新 AI" : newName, baseURL: newBase) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("填入名称和 OpenAI 兼容的接口地址（程序会在其后拼接 /chat/completions 与 /models）")
+        }
+    }
+}
+
+// MARK: - 单个提供商编辑（含多个 API）
+struct ProviderEditorView: View {
+    @ObservedObject var store: ChatStore
+    let providerID: UUID
+    @Environment(\.dismiss) var dismiss
+    @State private var name = ""
+    @State private var baseURL = ""
+    @State private var apis: [APIConfig] = []
+
+    var body: some View {
+        Form {
+            Section(header: Text("AI 名称")) {
+                TextField("名称", text: $name)
+            }
+            Section(header: Text("接口地址（OpenAI 兼容）")) {
+                TextField("https://api.example.com/v1", text: $baseURL)
+                    .autocapitalization(.none).disableAutocorrection(true)
+            }
+            Section(header: Text("API（可添加多个，各起昵称）")) {
+                ForEach(apis.indices, id: \.self) { i in
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("昵称，如 主号 / 备用", text: Binding(
+                            get: { apis[i].nickname },
+                            set: { apis[i].nickname = $0 }
+                        )).font(.subheadline)
+                        SecureField("API Key", text: Binding(
+                            get: { apis[i].key },
+                            set: { apis[i].key = $0 }
+                        ))
+                        .autocapitalization(.none).disableAutocorrection(true)
                     }
                 }
+                .onDelete { idx in apis.remove(atOffsets: idx) }
+                Button {
+                    apis.append(APIConfig(nickname: "API \(apis.count + 1)", key: ""))
+                } label: { Label("添加 API", systemImage: "plus.circle") }
+            }
+            Section {
+                Button("保存") {
+                    store.updateProvider(providerID, name: name.isEmpty ? "未命名" : name, baseURL: baseURL, apis: apis)
+                    dismiss()
+                }
+            }
+        }
+        .navigationTitle("编辑")
+        .onAppear {
+            if let p = store.providers.first(where: { $0.id == providerID }) {
+                name = p.name
+                baseURL = p.baseURL
+                apis = p.apis
             }
         }
     }
