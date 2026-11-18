@@ -1806,51 +1806,46 @@ func mdInline(_ s: String) -> Text {
     return Text(s)
 }
 
-func highlightedCode(_ code: String) -> Text {
+// 用 AttributedString（连续存储）避免 Text 深层拼接导致栈溢出
+func highlightedCode(_ code: String) -> AttributedString {
     let keywords: Set<String> = ["func","let","var","if","else","for","while","return","struct","class","enum","import","guard","switch","case","break","continue","true","false","nil","self","init","private","public","static","try","catch","throw","throws","async","await","in","where","default","do","extension","protocol","typealias","defer","some","any","const","def","elif","lambda","None","True","False","and","or","not","from","as","with","yield","function","new","this","typeof","void","int","float","double","bool","string","package","using","namespace","template","auto","null","undefined","print","println"]
-    var result = Text("")
-    var idx = code.startIndex
-    while idx < code.endIndex {
-        let ch = code[idx]
+    var out = AttributedString()
+    func add(_ s: String, _ col: Color?) {
+        var a = AttributedString(s)
+        if let col = col { a.foregroundColor = col }
+        out.append(a)
+    }
+    let chars = Array(code)
+    let n = chars.count
+    var i = 0
+    while i < n {
+        let ch = chars[i]
         if ch == "\"" || ch == "'" || ch == "`" {
             let quote = ch
-            var j = code.index(after: idx)
-            var s = String(ch)
-            while j < code.endIndex {
-                let c = code[j]; s.append(c)
-                j = code.index(after: j)
+            var j = i; var s = String(ch); j += 1
+            while j < n {
+                let c = chars[j]; s.append(c); j += 1
                 if c == "\n" { break }
                 if c == quote { break }
             }
-            result = result + Text(s).foregroundColor(.green)
-            idx = j; continue
+            add(s, .green); i = j
+        } else if ch == "/" && i + 1 < n && chars[i + 1] == "/" {
+            var j = i; var s = ""
+            while j < n && chars[j] != "\n" { s.append(chars[j]); j += 1 }
+            add(s, .gray); i = j
+        } else if ch.isNumber {
+            var j = i; var s = ""
+            while j < n && (chars[j].isNumber || chars[j] == ".") { s.append(chars[j]); j += 1 }
+            add(s, .orange); i = j
+        } else if ch.isLetter || ch == "_" {
+            var j = i; var s = ""
+            while j < n && (chars[j].isLetter || chars[j].isNumber || chars[j] == "_") { s.append(chars[j]); j += 1 }
+            add(s, keywords.contains(s) ? .purple : nil); i = j
+        } else {
+            add(String(ch), nil); i += 1
         }
-        if ch == "/" {
-            let nxt = code.index(after: idx)
-            if nxt < code.endIndex && code[nxt] == "/" {
-                var j = idx; var s = ""
-                while j < code.endIndex && code[j] != "\n" { s.append(code[j]); j = code.index(after: j) }
-                result = result + Text(s).foregroundColor(.gray)
-                idx = j; continue
-            }
-        }
-        if ch.isNumber {
-            var j = idx; var s = ""
-            while j < code.endIndex && (code[j].isNumber || code[j] == ".") { s.append(code[j]); j = code.index(after: j) }
-            result = result + Text(s).foregroundColor(.orange)
-            idx = j; continue
-        }
-        if ch.isLetter || ch == "_" {
-            var j = idx; var s = ""
-            while j < code.endIndex && (code[j].isLetter || code[j].isNumber || code[j] == "_") { s.append(code[j]); j = code.index(after: j) }
-            if keywords.contains(s) { result = result + Text(s).foregroundColor(.purple) }
-            else { result = result + Text(s) }
-            idx = j; continue
-        }
-        result = result + Text(String(ch))
-        idx = code.index(after: idx)
     }
-    return result
+    return out
 }
 
 struct CodeBlockView: View {
@@ -1870,10 +1865,17 @@ struct CodeBlockView: View {
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(Color.black.opacity(0.22))
             ScrollView(.horizontal, showsIndicators: false) {
-                highlightedCode(code)
-                    .font(.system(size: CGFloat(max(11, fontSize - 2)), design: .monospaced))
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(10)
+                Group {
+                    if code.count > 20000 {
+                        Text(code)
+                    } else {
+                        Text(highlightedCode(code))
+                    }
+                }
+                .font(.system(size: CGFloat(max(11, fontSize - 2)), design: .monospaced))
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(10)
             }
         }
         .background(Color(UIColor.secondarySystemBackground))
@@ -1885,10 +1887,17 @@ struct MarkdownView: View {
     let text: String
     var fontSize: Double = 16
     var body: some View {
-        let blocks = parseMarkdownBlocks(text)
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { item in
-                blockView(item.element)
+        if text.count > 60000 {
+            Text(String(text.prefix(60000)) + "\n…（内容过长，已截断显示，可长按复制全部）")
+                .font(.system(size: CGFloat(fontSize)))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            let blocks = parseMarkdownBlocks(text)
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { item in
+                    blockView(item.element)
+                }
             }
         }
     }
