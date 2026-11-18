@@ -26,6 +26,8 @@ targets:
       properties:
         CFBundleDisplayName: 我的DeepSeek
         CFBundleIconName: AppIcon
+        NSSpeechRecognitionUsageDescription: 需要语音识别把你说的话转为文字提问
+        NSMicrophoneUsageDescription: 需要使用麦克风进行语音输入
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
