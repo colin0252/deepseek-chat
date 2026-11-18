@@ -5,6 +5,8 @@ import PhotosUI
 import UIKit
 import UniformTypeIdentifiers
 import Compression
+import AVFoundation
+import Speech
 
 // MARK: - 数据模型
 struct PickedFile: Identifiable {
@@ -23,6 +25,7 @@ struct MessageAttachment: Identifiable, Codable {
     var isImage: Bool
     var fileId: String?
     var thumbBase64: String?
+    var imageDataBase64: String? = nil
 }
 
 struct ChatMessage: Identifiable, Codable {
@@ -130,6 +133,17 @@ enum FileClassifier {
         }
         return PickedFile(data: jpeg, filename: "photo.jpg", isImage: true,
                           purpose: "user_data", mimeType: "image/jpeg", isZip: false)
+    }
+
+    static func base64Image(from data: Data, maxSide: CGFloat = 1024) -> String? {
+        guard let ui = UIImage(data: data) else { return nil }
+        let ratio = min(1, maxSide / max(ui.size.width, ui.size.height))
+        let size = CGSize(width: max(1, ui.size.width * ratio), height: max(1, ui.size.height * ratio))
+        UIGraphicsBeginImageContextWithOptions(size, false, 1)
+        ui.draw(in: CGRect(origin: .zero, size: size))
+        let img = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return img?.jpegData(compressionQuality: 0.8)?.base64EncodedString()
     }
 
     static func thumbnail(from data: Data) -> String? {
@@ -629,15 +643,44 @@ final class ChatClient {
 
     private func encodeMessages(_ msgs: [ChatMessage]) -> [[String: Any]] {
         msgs.map { m -> [String: Any] in
-            let files = m.attachments.filter { $0.fileId != nil }
-            if !files.isEmpty {
-                var blocks: [[String: Any]] = []
-                if !m.content.isEmpty { blocks.append(["type": "text", "text": m.content]) }
-                for f in files { if let fid = f.fileId { blocks.append(["type": "file", "file_id": fid]) } }
-                return ["role": m.role.rawValue, "content": blocks]
-            } else {
+            var parts: [[String: Any]] = []
+            for a in m.attachments {
+                if let fid = a.fileId {
+                    parts.append(["type": "file", "file_id": fid])
+                } else if let b64 = a.imageDataBase64 {
+                    parts.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]])
+                }
+            }
+            if parts.isEmpty {
                 return ["role": m.role.rawValue, "content": m.content]
             }
+            var content: [[String: Any]] = []
+            if !m.content.isEmpty { content.append(["type": "text", "text": m.content]) }
+            content.append(contentsOf: parts)
+            return ["role": m.role.rawValue, "content": content]
+        }
+    }
+
+    // DeepSeek 余额查询（GET /user/balance）
+    func fetchBalance() async -> String {
+        guard let url = URL(string: cleanedBase() + "/user/balance") else { return "地址无效" }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if code != 200 { return "获取失败：HTTP \(code)" }
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let infos = obj["balance_infos"] as? [[String: Any]], let f = infos.first {
+                    let cur = f["currency"] as? String ?? ""
+                    let total = f["total_balance"] as? String ?? ""
+                    return "余额：\(total) \(cur)"
+                }
+                if let avail = obj["is_available"] as? Bool { return avail ? "可用" : "不可用" }
+            }
+            return "余额：未知"
+        } catch {
+            return "获取失败：\(error.localizedDescription)"
         }
     }
 
@@ -957,6 +1000,41 @@ final class ChatStore: ObservableObject {
         if appearance == 1 { return .light }
         if appearance == 2 { return .dark }
         return nil
+    }
+
+    // MARK: 备份 / 恢复
+    func backupArchive() -> URL? {
+        var filesOut: [(String, Data)] = []
+        if let d = try? JSONEncoder().encode(conversations) { filesOut.append(("conversations.json", d)) }
+        if let d = try? JSONEncoder().encode(providers) { filesOut.append(("providers.json", d)) }
+        let zip = ZipWriter.create(files: filesOut)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("备份.zip")
+        do { try zip.write(to: url); return url } catch { return nil }
+    }
+
+    func restoreArchive(_ url: URL) async -> Bool {
+        let filesData = await Task.detached { () -> [(String, Data)] in
+            guard let data = FileClassifier.readData(url) else { return [] }
+            return ZipReader.extractFiles(from: data, onlyExtensions: nil)
+        }.value
+        guard !filesData.isEmpty else { return false }
+        var ok = false
+        for (n, d) in filesData {
+            let low = n.lowercased()
+            if low.hasSuffix("conversations.json"), let convs = try? JSONDecoder().decode([Conversation].self, from: d), !convs.isEmpty {
+                conversations = convs; ok = true
+            }
+            if low.hasSuffix("providers.json"), let provs = try? JSONDecoder().decode([AIProvider].self, from: d), !provs.isEmpty {
+                providers = provs
+                for i in providers.indices { for j in providers[i].apis.indices { providers[i].apis[j].key = Keychain.read("api_\(providers[i].apis[j].id.uuidString)") } }
+                persistProviders()
+            }
+        }
+        if ok {
+            if !conversations.contains(where: { $0.id == currentID }), let f = conversations.first { currentID = f.id }
+            persist()
+        }
+        return ok
     }
 
     func setMode(_ m: ChatMode) {
@@ -1410,10 +1488,6 @@ final class ChatStore: ObservableObject {
         guard !api.key.isEmpty else { errorText = "该 API 未填写 Key"; return }
         let isDeepSeek = provider.baseURL.lowercased().contains("deepseek")
         let nonZip = files.filter { !$0.isZip }
-        if !nonZip.isEmpty && !isDeepSeek {
-            errorText = "当前 AI（\(provider.name)）暂不支持上传文件，请改用 DeepSeek 或改发文字"
-            return
-        }
         errorText = nil
         statusText = nil
         isSending = true
@@ -1422,6 +1496,7 @@ final class ChatStore: ObservableObject {
 
         var meta: [MessageAttachment] = []
         var zipText = ""
+        var extraText = ""
         do {
             for f in files where f.isZip {
                 statusText = "正在解析压缩包 \(f.filename)…"
@@ -1429,10 +1504,20 @@ final class ChatStore: ObservableObject {
                 zipText += t.isEmpty ? "\n--- \(f.filename)：未找到可读文本 ---\n" : t
             }
             for f in nonZip {
-                statusText = "正在上传 \(f.filename)…"
-                let fid = try await client.uploadFile(f)
-                let thumb = f.isImage ? FileClassifier.thumbnail(from: f.data) : nil
-                meta.append(MessageAttachment(filename: f.filename, isImage: f.isImage, fileId: fid, thumbBase64: thumb))
+                if isDeepSeek {
+                    statusText = "正在上传 \(f.filename)…"
+                    let fid = try await client.uploadFile(f)
+                    let thumb = f.isImage ? FileClassifier.thumbnail(from: f.data) : nil
+                    meta.append(MessageAttachment(filename: f.filename, isImage: f.isImage, fileId: fid, thumbBase64: thumb))
+                } else if f.isImage {
+                    let b64 = FileClassifier.base64Image(from: f.data)
+                    let thumb = FileClassifier.thumbnail(from: f.data)
+                    meta.append(MessageAttachment(filename: f.filename, isImage: true, fileId: nil, thumbBase64: thumb, imageDataBase64: b64))
+                } else if let s = String(data: f.data, encoding: .utf8) {
+                    extraText += "\n\n--- \(f.filename) ---\n" + String(s.prefix(20000))
+                } else {
+                    extraText += "\n\n（已跳过二进制文件：\(f.filename)）"
+                }
             }
         } catch {
             let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
@@ -1447,6 +1532,7 @@ final class ChatStore: ObservableObject {
         if !zipText.isEmpty {
             finalText += (finalText.isEmpty ? "" : "\n\n") + "[压缩包内容]\n" + zipText
         }
+        if !extraText.isEmpty { finalText += extraText }
         if currentMode == .work && !finalText.isEmpty {
             finalText = "[工作模式] 请把任务拆成步骤逐步推进，每一步给出明确进展；全部完成时，最后单独一行输出：[完成]\n\n" + finalText
         }
@@ -1528,6 +1614,69 @@ final class ChatStore: ObservableObject {
             if cur.contains("[完成]") || cur.contains("【完成】") { workPaused = false; return }
         }
         if steps >= workStepLimit { workPaused = true }
+    }
+}
+
+// MARK: - 语音（TTS 朗读 + STT 语音输入）
+final class SpeechManager {
+    static let shared = SpeechManager()
+    private let synth = AVSpeechSynthesizer()
+    func speak(_ text: String) {
+        if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
+        let u = AVSpeechUtterance(string: text)
+        u.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+        synth.speak(u)
+    }
+    func stop() { synth.stopSpeaking(at: .immediate) }
+}
+
+final class SpeechRecognizer: ObservableObject {
+    @Published var isRecording = false
+    @Published var transcript = ""
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let engine = AVAudioEngine()
+
+    func toggle() { isRecording ? finish() : start() }
+
+    func start() {
+        SFSpeechRecognizer.requestAuthorization { _ in }
+        transcript = ""
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+            let req = SFSpeechAudioBufferRecognitionRequest()
+            req.shouldReportPartialResults = true
+            request = req
+            let input = engine.inputNode
+            let format = input.outputFormat(forBus: 0)
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buf, _ in req.append(buf) }
+            engine.prepare()
+            try engine.start()
+            isRecording = true
+            task = recognizer?.recognitionTask(with: req) { [weak self] result, error in
+                if let r = result {
+                    let s = r.bestTranscription.formattedString
+                    DispatchQueue.main.async { self?.transcript = s }
+                }
+                if error != nil || (result?.isFinal ?? false) {
+                    DispatchQueue.main.async { self?.finish() }
+                }
+            }
+        } catch {
+            isRecording = false
+        }
+    }
+
+    func finish() {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        request?.endAudio()
+        task?.cancel()
+        request = nil; task = nil
+        isRecording = false
     }
 }
 
@@ -1802,6 +1951,7 @@ struct MessageRow: View {
 // MARK: - 主界面
 struct ContentView: View {
     @StateObject private var store = ChatStore()
+    @StateObject private var speech = SpeechRecognizer()
     @State private var input = ""
     @State private var activeSheet: ActiveSheet?
     @State private var picked: [PickedFile] = []
@@ -1823,6 +1973,8 @@ struct ContentView: View {
                                         Button { UIPasteboard.general.string = m.content } label: { Label("复制", systemImage: "doc.on.doc") }
                                         if m.role == .assistant {
                                             Button { Task { await store.regenerate() } } label: { Label("重新生成", systemImage: "arrow.clockwise") }
+                                            Button { SpeechManager.shared.speak(m.content) } label: { Label("朗读", systemImage: "speaker.wave.2") }
+                                            Button { SpeechManager.shared.stop() } label: { Label("停止朗读", systemImage: "speaker.slash") }
                                         }
                                         if m.role == .user {
                                             Button {
@@ -1931,11 +2083,17 @@ struct ContentView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
-                    TextField("输入消息…", text: $input, axis: .vertical)
+                    TextField(speech.isRecording ? "正在听…" : "输入消息…", text: $input, axis: .vertical)
                         .focused($inputFocused).lineLimit(1...5)
                         .padding(.horizontal, 10).padding(.vertical, 9)
                         .background(Color(UIColor.secondarySystemBackground))
                         .clipShape(RoundedRectangle(cornerRadius: 18))
+
+                    Button { speech.toggle() } label: {
+                        Image(systemName: speech.isRecording ? "mic.fill" : "mic")
+                            .font(.system(size: 22))
+                            .foregroundColor(speech.isRecording ? .red : .secondary)
+                    }
 
                     Button {
                         let t = input; let files = picked
@@ -1953,6 +2111,7 @@ struct ContentView: View {
             .navigationTitle(store.currentTitle)
             .navigationBarTitleDisplayMode(.inline)
             .preferredColorScheme(store.colorScheme)
+            .onChange(of: speech.transcript) { v in if !v.isEmpty { input = v } }
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarLeading) {
                     Button { activeSheet = .convList } label: { Image(systemName: "list.bullet") }
@@ -2042,6 +2201,7 @@ struct AISelectorView: View {
     @State private var loading = false
     @State private var testing = false
     @State private var testResult: String?
+    @State private var balanceResult: String?
 
     private var provider: AIProvider? { store.providers.first { $0.id == providerID } }
     private var apiKey: String { provider?.apis.first { $0.id == apiID }?.key ?? "" }
@@ -2095,6 +2255,9 @@ struct AISelectorView: View {
                     Button(testing ? "测试中…" : "测试连接") { testConn() }
                         .disabled(testing || provider == nil)
                     if let r = testResult { Text(r).font(.caption).foregroundColor(.secondary) }
+                    Button("查询余额（DeepSeek）") { queryBalance() }
+                        .disabled(provider == nil)
+                    if let b = balanceResult { Text(b).font(.caption).foregroundColor(.secondary) }
                 }
             }
             .navigationTitle("选择 AI")
@@ -2127,6 +2290,18 @@ struct AISelectorView: View {
                 if model.isEmpty, let first = store.models(for: p).first?.id { model = first }
                 loading = false
             }
+        }
+    }
+
+    private func queryBalance() {
+        guard let p = provider, let a = (p.apis.first(where: { $0.id == apiID }) ?? p.apis.first) else { balanceResult = "请先选择提供商和 API"; return }
+        guard !a.key.isEmpty else { balanceResult = "该 API 未填 Key"; return }
+        guard p.baseURL.lowercased().contains("deepseek") else { balanceResult = "仅 DeepSeek 支持余额查询"; return }
+        balanceResult = "查询中…"
+        Task {
+            let client = ChatClient(baseURL: p.baseURL, apiKey: a.key, model: "", webSearch: false, isDeepSeek: true)
+            let r = await client.fetchBalance()
+            await MainActor.run { balanceResult = r }
         }
     }
 
@@ -2250,6 +2425,10 @@ struct ConversationListView: View {
 struct SettingsView: View {
     @ObservedObject var store: ChatStore
     @Environment(\.dismiss) var dismiss
+    @State private var showBackup = false
+    @State private var showRestore = false
+    @State private var backupItems: [Any] = []
+    @State private var restoreMsg: String?
 
     var body: some View {
         NavigationView {
@@ -2291,6 +2470,15 @@ struct SettingsView: View {
                     }
                     Stepper("字体大小：\(Int(store.fontSize))", value: Binding(get: { store.fontSize }, set: { store.fontSize = $0; store.saveGenSettings() }), in: 12...24, step: 1)
                 }
+                Section(header: Text("数据备份 / 恢复"), footer: Text("备份包含对话与配置（不含 API Key，换机后需重新填写 Key）。可存到 iCloud 云盘实现跨设备恢复。")) {
+                    Button { if let u = store.backupArchive() { backupItems = [u]; showBackup = true } } label: {
+                        Label("备份（导出对话+配置）", systemImage: "arrow.down.doc")
+                    }
+                    Button { showRestore = true } label: {
+                        Label("从备份恢复", systemImage: "arrow.up.doc")
+                    }
+                    if let m = restoreMsg { Text(m).font(.caption).foregroundColor(.secondary) }
+                }
                 Section(header: Text("说明")) {
                     Text("每个对话可在聊天页顶部单独选择用哪个 AI / 哪个 API / 哪个模型。文件、ZIP、联网搜索为 DeepSeek 专属能力；其他 AI 仅支持文字与 ZIP 文本提取。")
                         .font(.caption).foregroundColor(.secondary)
@@ -2302,6 +2490,17 @@ struct SettingsView: View {
             .navigationTitle("设置")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
+            }
+            .sheet(isPresented: $showBackup) { ActivityView(items: backupItems) }
+            .sheet(isPresented: $showRestore) {
+                DocumentPicker(allowsMultiple: false, contentTypes: [.data]) { urls in
+                    showRestore = false
+                    guard let url = urls.first else { return }
+                    Task {
+                        let ok = await store.restoreArchive(url)
+                        restoreMsg = ok ? "恢复成功（\(store.conversations.count) 个对话）" : "恢复失败：文件无效"
+                    }
+                }
             }
         }
     }
