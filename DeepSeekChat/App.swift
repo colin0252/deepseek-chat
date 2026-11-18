@@ -33,6 +33,8 @@ struct ChatMessage: Identifiable, Codable {
     var attachments: [MessageAttachment] = []
 }
 
+enum ChatMode: String, Codable { case chat, work }
+
 struct Conversation: Identifiable, Codable {
     var id = UUID()
     var title: String = "新对话"
@@ -41,6 +43,7 @@ struct Conversation: Identifiable, Codable {
     var providerID: UUID?
     var apiID: UUID?
     var model: String?
+    var mode: ChatMode? = nil
 }
 
 // 一个 API 配置（昵称 + key）。key 不写入 json，只存钥匙串。
@@ -84,16 +87,7 @@ enum FileClassifier {
     static func readData(_ url: URL) -> Data? {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
-        var result: Data? = nil
-        var coordError: NSError? = nil
-        let coordinator = NSFileCoordinator()
-        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
-            result = try? Data(contentsOf: newURL, options: .mappedIfSafe)
-            if result == nil { result = try? Data(contentsOf: newURL) }
-        }
-        if result == nil { result = try? Data(contentsOf: url, options: .mappedIfSafe) }
-        if result == nil { result = try? Data(contentsOf: url) }
-        return result
+        return try? Data(contentsOf: url)
     }
 
     static func make(from url: URL) -> PickedFile? {
@@ -567,12 +561,19 @@ final class ChatClient {
     let model: String
     let webSearch: Bool
     let isDeepSeek: Bool
-    init(baseURL: String, apiKey: String, model: String, webSearch: Bool, isDeepSeek: Bool) {
+    let temperature: Double
+    let topP: Double
+    let maxTokens: Int
+    init(baseURL: String, apiKey: String, model: String, webSearch: Bool, isDeepSeek: Bool,
+         temperature: Double = 0.7, topP: Double = 1.0, maxTokens: Int = 0) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.model = model
         self.webSearch = webSearch
         self.isDeepSeek = isDeepSeek
+        self.temperature = temperature
+        self.topP = topP
+        self.maxTokens = maxTokens
     }
 
     func cleanedBase() -> String {
@@ -656,6 +657,9 @@ final class ChatClient {
                         "stream": true,
                         "messages": encodeMessages(messages)
                     ]
+                    if temperature >= 0 { body["temperature"] = temperature }
+                    if topP > 0 { body["top_p"] = topP }
+                    if maxTokens > 0 { body["max_tokens"] = maxTokens }
                     if webSearch && isDeepSeek {
                         let tools: [[String: Any]] = [
                             ["type": "deepseek_web_search"],
@@ -890,6 +894,19 @@ final class ChatStore: ObservableObject {
     @Published var ghLoggedIn: Bool = false
     var ghToken: String = ""
 
+    // 全局生成参数 / 外观
+    @Published var temperature: Double = 0.7
+    @Published var topP: Double = 1.0
+    @Published var maxTokens: Int = 0
+    @Published var contextLimit: Int = 20
+    @Published var fontSize: Double = 16
+    @Published var appearance: Int = 0
+    @Published var workStepLimit: Int = 25
+
+    // 工作模式状态
+    @Published var workPaused: Bool = false
+    @Published var workStepsRun: Int = 0
+
     private var convURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("conversations.json")
     }
@@ -900,7 +917,93 @@ final class ChatStore: ObservableObject {
     init() {
         loadProviders()
         loadGitHub()
+        loadGenSettings()
         loadConversations()
+    }
+
+    func loadGenSettings() {
+        let d = UserDefaults.standard
+        temperature = d.object(forKey: "temperature") as? Double ?? 0.7
+        topP = d.object(forKey: "topP") as? Double ?? 1.0
+        maxTokens = d.object(forKey: "maxTokens") as? Int ?? 0
+        contextLimit = d.object(forKey: "contextLimit") as? Int ?? 20
+        fontSize = d.object(forKey: "fontSize") as? Double ?? 16
+        appearance = d.object(forKey: "appearance") as? Int ?? 0
+        workStepLimit = d.object(forKey: "workStepLimit") as? Int ?? 25
+    }
+
+    func saveGenSettings() {
+        let d = UserDefaults.standard
+        d.set(temperature, forKey: "temperature")
+        d.set(topP, forKey: "topP")
+        d.set(maxTokens, forKey: "maxTokens")
+        d.set(contextLimit, forKey: "contextLimit")
+        d.set(fontSize, forKey: "fontSize")
+        d.set(appearance, forKey: "appearance")
+        d.set(workStepLimit, forKey: "workStepLimit")
+    }
+
+    func applyContextLimit(_ msgs: [ChatMessage]) -> [ChatMessage] {
+        if contextLimit <= 0 || msgs.count <= contextLimit { return msgs }
+        return Array(msgs.suffix(contextLimit))
+    }
+
+    var currentMode: ChatMode {
+        if let i = currentIndex { return conversations[i].mode ?? .chat }
+        return .chat
+    }
+
+    var colorScheme: ColorScheme? {
+        if appearance == 1 { return .light }
+        if appearance == 2 { return .dark }
+        return nil
+    }
+
+    func setMode(_ m: ChatMode) {
+        guard let i = currentIndex else { return }
+        conversations[i].mode = m
+        workPaused = false
+        persist()
+    }
+
+    func rename(_ id: UUID, title: String) {
+        guard let i = conversations.firstIndex(where: { $0.id == id }) else { return }
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        conversations[i].title = t.isEmpty ? conversations[i].title : t
+        persist()
+    }
+
+    func truncateFrom(_ messageID: UUID) -> String {
+        guard let i = currentIndex else { return "" }
+        var conv = conversations[i]
+        guard let idx = conv.messages.firstIndex(where: { $0.id == messageID }) else { return "" }
+        let content = conv.messages[idx].content
+        conv.messages = Array(conv.messages.prefix(idx))
+        conversations[i] = conv
+        persist()
+        return content
+    }
+
+    func regenerate() async {
+        guard !isSending, let i = currentIndex else { return }
+        var conv = conversations[i]
+        guard let lastUserIdx = conv.messages.lastIndex(where: { $0.role == .user }) else { return }
+        let userText = conv.messages[lastUserIdx].content
+        conv.messages = Array(conv.messages.prefix(lastUserIdx))
+        conversations[i] = conv
+        persist()
+        await send(userText, files: [])
+    }
+
+    func continueWork() async {
+        guard !isSending, let i = currentIndex else { return }
+        isSending = true
+        workPaused = false
+        let assistantIndex = conversations[i].messages.count - 1
+        await runWorkMode(assistantIndex: assistantIndex)
+        statusText = nil
+        isSending = false
+        persist()
     }
 
     // 会话当前
@@ -1279,6 +1382,22 @@ final class ChatStore: ObservableObject {
         return convs.count
     }
 
+    // 后台读取+解析，避免主线程卡死
+    func importFromURL(_ url: URL) async -> Int {
+        let name = url.lastPathComponent
+        let result = await Task.detached { () -> (read: Bool, convs: [Conversation]) in
+            guard let data = FileClassifier.readData(url) else { return (false, []) }
+            return (true, ConversationImporter.parse(data, filename: name))
+        }.value
+        guard result.read else { return -1 }
+        let convs = result.convs
+        guard !convs.isEmpty else { return 0 }
+        conversations.insert(contentsOf: convs, at: 0)
+        if let f = convs.first { currentID = f.id }
+        persist()
+        return convs.count
+    }
+
     // MARK: 发送
     func send(_ text: String, files: [PickedFile]) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1299,7 +1418,7 @@ final class ChatStore: ObservableObject {
         statusText = nil
         isSending = true
 
-        let client = ChatClient(baseURL: provider.baseURL, apiKey: api.key, model: model, webSearch: isDeepSeek, isDeepSeek: isDeepSeek)
+        let client = ChatClient(baseURL: provider.baseURL, apiKey: api.key, model: model, webSearch: isDeepSeek, isDeepSeek: isDeepSeek, temperature: temperature, topP: topP, maxTokens: maxTokens)
 
         var meta: [MessageAttachment] = []
         var zipText = ""
@@ -1328,11 +1447,23 @@ final class ChatStore: ObservableObject {
         if !zipText.isEmpty {
             finalText += (finalText.isEmpty ? "" : "\n\n") + "[压缩包内容]\n" + zipText
         }
+        if currentMode == .work && !finalText.isEmpty {
+            finalText = "[工作模式] 请把任务拆成步骤逐步推进，每一步给出明确进展；全部完成时，最后单独一行输出：[完成]\n\n" + finalText
+        }
 
         appendToCurrent(ChatMessage(role: .user, content: finalText, attachments: meta))
         let assistantIndex = messages.count
         appendToCurrent(ChatMessage(role: .assistant, content: "", attachments: []))
-        let convo = Array(messages.prefix(assistantIndex))
+        let convo = applyContextLimit(Array(messages.prefix(assistantIndex)))
+
+        if currentMode == .work {
+            workStepsRun = 0
+            await runWorkMode(assistantIndex: assistantIndex)
+            statusText = nil
+            isSending = false
+            persist()
+            return
+        }
 
         do {
             for try await ev in client.stream(messages: convo) {
@@ -1354,6 +1485,49 @@ final class ChatStore: ObservableObject {
         statusText = nil
         isSending = false
         persist()
+    }
+
+    // 工作模式：自动分步推进，每轮最多 workStepLimit 步（默认 25）后暂停，等用户确认再继续
+    func runWorkMode(assistantIndex: Int) async {
+        let (providerOpt, apiOpt, modelOpt) = selection()
+        guard let provider = providerOpt, let api = apiOpt, let model = modelOpt, !model.isEmpty else { return }
+        let isDeepSeek = provider.baseURL.lowercased().contains("deepseek")
+        let client = ChatClient(baseURL: provider.baseURL, apiKey: api.key, model: model, webSearch: isDeepSeek, isDeepSeek: isDeepSeek, temperature: temperature, topP: topP, maxTokens: maxTokens)
+        let base = workStepsRun
+        var steps = 0
+        while steps < workStepLimit {
+            if !isSending { return }
+            guard let i = currentIndex, assistantIndex < conversations[i].messages.count else { return }
+            let existing = conversations[i].messages[assistantIndex].content
+            var stepMessages = Array(conversations[i].messages.prefix(assistantIndex))
+            if !existing.isEmpty {
+                stepMessages.append(ChatMessage(role: .assistant, content: existing, attachments: []))
+                stepMessages.append(ChatMessage(role: .user, content: "继续推进下一步（第 \(base + steps + 1) 步）。若任务已完成，请只回复：[完成]", attachments: []))
+            }
+            let stepNo = base + steps + 1
+            var cur = ""
+            do {
+                for try await ev in client.stream(messages: applyContextLimit(stepMessages)) {
+                    switch ev {
+                    case .text(let t):
+                        cur = t
+                        let sep = existing.isEmpty ? "" : "\n\n"
+                        setContent(assistantIndex, existing + sep + "【第 \(stepNo) 步】\n" + cur)
+                    case .status(let s): statusText = s.isEmpty ? nil : s
+                    }
+                }
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                setContent(assistantIndex, existing + "\n\n⚠️ " + msg)
+                return
+            }
+            let sep = existing.isEmpty ? "" : "\n\n"
+            setContent(assistantIndex, existing + sep + "【第 \(stepNo) 步】\n" + cur)
+            steps += 1
+            workStepsRun += 1
+            if cur.contains("[完成]") || cur.contains("【完成】") { workPaused = false; return }
+        }
+        if steps >= workStepLimit { workPaused = true }
     }
 }
 
@@ -1418,6 +1592,7 @@ struct AttachmentChip: View {
 // MARK: - 单条消息
 struct MessageRow: View {
     let message: ChatMessage
+    var fontSize: Double = 16
     var body: some View {
         let isUser = message.role == .user
         HStack(alignment: .top, spacing: 8) {
@@ -1426,6 +1601,7 @@ struct MessageRow: View {
                 ForEach(message.attachments) { att in AttachmentChip(att: att) }
                 if !message.content.isEmpty {
                     Text(message.content)
+                        .font(.system(size: CGFloat(fontSize)))
                         .padding(.horizontal, 12).padding(.vertical, 9)
                         .background(isUser ? Color.accentColor.opacity(0.22) : Color(UIColor.secondarySystemBackground))
                         .foregroundColor(.primary)
@@ -1452,6 +1628,7 @@ struct ContentView: View {
     @State private var showPhotos = false
     @State private var exportItems: [Any] = []
     @FocusState private var inputFocused: Bool
+    private let presets = ["翻译成英文", "润色文字", "总结要点", "写代码", "解释代码", "列大纲"]
 
     var body: some View {
         NavigationView {
@@ -1459,7 +1636,21 @@ struct ContentView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(store.messages) { m in MessageRow(message: m).id(m.id) }
+                            ForEach(store.messages) { m in
+                                MessageRow(message: m, fontSize: store.fontSize).id(m.id)
+                                    .contextMenu {
+                                        Button { UIPasteboard.general.string = m.content } label: { Label("复制", systemImage: "doc.on.doc") }
+                                        if m.role == .assistant {
+                                            Button { Task { await store.regenerate() } } label: { Label("重新生成", systemImage: "arrow.clockwise") }
+                                        }
+                                        if m.role == .user {
+                                            Button {
+                                                input = store.truncateFrom(m.id)
+                                                inputFocused = true
+                                            } label: { Label("编辑并重新发送", systemImage: "pencil") }
+                                        }
+                                    }
+                            }
                             if let s = store.statusText { Text(s).font(.footnote).foregroundColor(.secondary) }
                         }
                         .padding(.horizontal, 12).padding(.vertical, 14)
@@ -1480,6 +1671,14 @@ struct ContentView: View {
 
                 Divider()
 
+                // 聊天模式 / 工作模式
+                Picker("模式", selection: Binding(get: { store.currentMode }, set: { store.setMode($0) })) {
+                    Text("聊天模式").tag(ChatMode.chat)
+                    Text("工作模式").tag(ChatMode.work)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 12).padding(.top, 6)
+
                 // 选择当前 AI（每个对话独立）
                 Button { activeSheet = .ai } label: {
                     HStack(spacing: 6) {
@@ -1492,6 +1691,22 @@ struct ContentView: View {
                     .background(Color(UIColor.secondarySystemBackground))
                 }
                 .foregroundColor(.primary)
+
+                // 提示词预设
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(presets, id: \.self) { p in
+                            Button { input = p + "：" ; inputFocused = true } label: {
+                                Text(p).font(.caption).padding(.horizontal, 10).padding(.vertical, 5)
+                                    .background(Color(UIColor.secondarySystemBackground))
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                }
+                .padding(.top, 6)
 
                 // 附件区
                 HStack(spacing: 10) {
@@ -1525,6 +1740,15 @@ struct ContentView: View {
                     }
                 }
 
+                if store.workPaused {
+                    Button { Task { await store.continueWork() } } label: {
+                        Label("已运行 \(store.workStepsRun) 步（每轮上限 \(store.workStepLimit)），点此继续", systemImage: "play.fill")
+                            .font(.footnote).frame(maxWidth: .infinity)
+                            .padding(.vertical, 8).background(Color.accentColor.opacity(0.15))
+                    }
+                    .foregroundColor(.accentColor)
+                }
+
                 HStack(alignment: .bottom, spacing: 8) {
                     TextField("输入消息…", text: $input, axis: .vertical)
                         .focused($inputFocused).lineLimit(1...5)
@@ -1547,6 +1771,7 @@ struct ContentView: View {
             }
             .navigationTitle(store.currentTitle)
             .navigationBarTitleDisplayMode(.inline)
+            .preferredColorScheme(store.colorScheme)
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarLeading) {
                     Button { activeSheet = .convList } label: { Image(systemName: "list.bullet") }
@@ -1607,13 +1832,22 @@ struct ContentView: View {
     private func handlePickedFiles(_ urls: [URL]) {
         activeSheet = nil
         guard !urls.isEmpty else { return }
-        var arr: [PickedFile] = []
-        var failed: [String] = []
-        for url in urls {
-            if let pf = FileClassifier.make(from: url) { arr.append(pf) } else { failed.append(url.lastPathComponent) }
+        store.statusText = "正在读取文件…"
+        Task {
+            let r = await Task.detached { () -> (arr: [PickedFile], failed: [String]) in
+                var arr: [PickedFile] = []
+                var failed: [String] = []
+                for url in urls {
+                    if let pf = FileClassifier.make(from: url) { arr.append(pf) } else { failed.append(url.lastPathComponent) }
+                }
+                return (arr, failed)
+            }.value
+            await MainActor.run {
+                if !r.arr.isEmpty { picked.append(contentsOf: r.arr) }
+                if !r.failed.isEmpty { store.errorText = "无法读取文件：" + r.failed.joined(separator: "、") }
+                store.statusText = nil
+            }
         }
-        if !arr.isEmpty { picked.append(contentsOf: arr) }
-        if !failed.isEmpty { store.errorText = "无法读取文件：" + failed.joined(separator: "、") }
     }
 }
 
@@ -1625,6 +1859,8 @@ struct AISelectorView: View {
     @State private var apiID: UUID?
     @State private var model: String = ""
     @State private var loading = false
+    @State private var testing = false
+    @State private var testResult: String?
 
     private var provider: AIProvider? { store.providers.first { $0.id == providerID } }
     private var apiKey: String { provider?.apis.first { $0.id == apiID }?.key ?? "" }
@@ -1674,6 +1910,11 @@ struct AISelectorView: View {
                         }
                     }
                 }
+                Section(header: Text("连接测试")) {
+                    Button(testing ? "测试中…" : "测试连接") { testConn() }
+                        .disabled(testing || provider == nil)
+                    if let r = testResult { Text(r).font(.caption).foregroundColor(.secondary) }
+                }
             }
             .navigationTitle("选择 AI")
             .toolbar {
@@ -1707,6 +1948,24 @@ struct AISelectorView: View {
             }
         }
     }
+
+    private func testConn() {
+        guard let p = provider, let a = (p.apis.first(where: { $0.id == apiID }) ?? p.apis.first) else {
+            testResult = "请先选择提供商和 API"; return
+        }
+        guard !a.key.isEmpty else { testResult = "该 API 未填 Key"; return }
+        testing = true; testResult = "测试中…"
+        Task {
+            let client = ChatClient(baseURL: p.baseURL, apiKey: a.key, model: "", webSearch: false, isDeepSeek: false)
+            do {
+                let list = try await client.fetchModels()
+                await MainActor.run { testResult = list.isEmpty ? "连接成功（未返回模型列表）" : "连接成功，可用模型 \(list.count) 个"; testing = false }
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                await MainActor.run { testResult = "失败：" + msg; testing = false }
+            }
+        }
+    }
 }
 
 // MARK: - 会话列表
@@ -1715,6 +1974,14 @@ struct ConversationListView: View {
     @Environment(\.dismiss) var dismiss
     @State private var activeConvSheet: ConvSheet?
     @State private var exportItems: [Any] = []
+    @State private var searchText = ""
+    @State private var renamingID: UUID?
+    @State private var renameText = ""
+
+    private var filtered: [Conversation] {
+        if searchText.trimmingCharacters(in: .whitespaces).isEmpty { return store.conversations }
+        return store.conversations.filter { $0.title.localizedCaseInsensitiveContains(searchText) }
+    }
 
     var body: some View {
         NavigationView {
@@ -1736,7 +2003,7 @@ struct ConversationListView: View {
                     } label: { Label("导出全部对话（ZIP / TXT / Markdown / HTML）", systemImage: "square.and.arrow.up") }
                 }
                 Section(header: Text("历史对话")) {
-                    ForEach(store.conversations) { conv in
+                    ForEach(filtered) { conv in
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(conv.title).font(.body).lineLimit(1)
@@ -1751,20 +2018,27 @@ struct ConversationListView: View {
                             Button(role: .destructive) { store.delete(conv.id) } label: { Label("删除", systemImage: "trash") }
                         }
                         .contextMenu {
+                            Button { renamingID = conv.id; renameText = conv.title } label: { Label("重命名", systemImage: "pencil") }
                             Button(role: .destructive) { store.delete(conv.id) } label: { Label("删除对话", systemImage: "trash") }
                         }
                     }
                     .onDelete { idx in
-                        let ids = idx.map { store.conversations[$0].id }
+                        let ids = idx.map { filtered[$0].id }
                         for id in ids { store.delete(id) }
                     }
                 }
             }
             .navigationTitle("对话")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索对话")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) { EditButton() }
                 ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } }
+            }
+            .alert("重命名对话", isPresented: Binding(get: { renamingID != nil }, set: { if !$0 { renamingID = nil } })) {
+                TextField("对话名称", text: $renameText)
+                Button("保存") { if let id = renamingID { store.rename(id, title: renameText) }; renamingID = nil }
+                Button("取消", role: .cancel) { renamingID = nil }
             }
             .sheet(item: $activeConvSheet) { sheet in
                 switch sheet {
@@ -1772,10 +2046,12 @@ struct ConversationListView: View {
                     DocumentPicker(allowsMultiple: false, contentTypes: [.data]) { urls in
                         activeConvSheet = nil
                         guard let url = urls.first else { return }
-                        let n = store.importConversations(from: url)
-                        if n > 0 { dismiss() }
-                        else if n == 0 { store.errorText = "该文件没有可识别的对话" }
-                        else { store.errorText = "无法读取该文件" }
+                        Task {
+                            let n = await store.importFromURL(url)
+                            if n > 0 { dismiss() }
+                            else if n == 0 { store.errorText = "该文件没有可识别的对话" }
+                            else { store.errorText = "无法读取该文件" }
+                        }
                     }
                 case .export:
                     ActivityView(items: exportItems)
@@ -1818,6 +2094,21 @@ struct SettingsView: View {
                     }
                     Text(store.isGitHubConfigured ? "已配置：\(store.ghOwner)/\(store.ghRepo)@\(store.ghBranch)" : "未配置（需填令牌+仓库）")
                         .font(.caption).foregroundColor(.secondary)
+                }
+                Section(header: Text("模型参数")) {
+                    HStack { Text("温度"); Slider(value: Binding(get: { store.temperature }, set: { store.temperature = $0; store.saveGenSettings() }), in: 0...2, step: 0.1); Text(String(format: "%.1f", store.temperature)).font(.caption).frame(width: 34) }
+                    HStack { Text("Top P"); Slider(value: Binding(get: { store.topP }, set: { store.topP = $0; store.saveGenSettings() }), in: 0...1, step: 0.05); Text(String(format: "%.2f", store.topP)).font(.caption).frame(width: 44) }
+                    Stepper("最大回复长度：\(store.maxTokens == 0 ? "不限" : "\(store.maxTokens)")", value: Binding(get: { store.maxTokens }, set: { store.maxTokens = $0; store.saveGenSettings() }), in: 0...32000, step: 256)
+                    Stepper("上下文条数：\(store.contextLimit)", value: Binding(get: { store.contextLimit }, set: { store.contextLimit = $0; store.saveGenSettings() }), in: 1...100)
+                    Stepper("工作模式每轮步数：\(store.workStepLimit)", value: Binding(get: { store.workStepLimit }, set: { store.workStepLimit = $0; store.saveGenSettings() }), in: 5...100, step: 5)
+                }
+                Section(header: Text("外观")) {
+                    Picker("主题", selection: Binding(get: { store.appearance }, set: { store.appearance = $0; store.saveGenSettings() })) {
+                        Text("跟随系统").tag(0)
+                        Text("浅色").tag(1)
+                        Text("深色").tag(2)
+                    }
+                    Stepper("字体大小：\(Int(store.fontSize))", value: Binding(get: { store.fontSize }, set: { store.fontSize = $0; store.saveGenSettings() }), in: 12...24, step: 1)
                 }
                 Section(header: Text("说明")) {
                     Text("每个对话可在聊天页顶部单独选择用哪个 AI / 哪个 API / 哪个模型。文件、ZIP、联网搜索为 DeepSeek 专属能力；其他 AI 仅支持文字与 ZIP 文本提取。")
