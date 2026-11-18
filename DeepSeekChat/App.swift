@@ -1589,6 +1589,189 @@ struct AttachmentChip: View {
     }
 }
 
+// MARK: - Markdown 渲染（无三方依赖）
+enum MDBlock {
+    case paragraph(String)
+    case heading(Int, String)
+    case code(lang: String, body: String)
+    case bullet(String)
+    case numbered(Int, String)
+}
+
+func parseMarkdownBlocks(_ text: String) -> [MDBlock] {
+    var blocks: [MDBlock] = []
+    let lines = text.components(separatedBy: "\n")
+    var i = 0
+    var para: [String] = []
+    func flush() {
+        let s = para.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty { blocks.append(.paragraph(s)) }
+        para = []
+    }
+    while i < lines.count {
+        let line = lines[i]
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("```") {
+            flush()
+            let lang = String(t.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            var body: [String] = []
+            i += 1
+            while i < lines.count && !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                body.append(lines[i]); i += 1
+            }
+            if i < lines.count { i += 1 }
+            blocks.append(.code(lang: lang, body: body.joined(separator: "\n")))
+            continue
+        }
+        if t.hasPrefix("#") {
+            var level = 0; var h = t
+            while h.hasPrefix("#") { level += 1; h = String(h.dropFirst()) }
+            flush()
+            if h.hasPrefix(" ") { h = String(h.dropFirst()) }
+            blocks.append(.heading(min(level, 6), h))
+            i += 1; continue
+        }
+        if t.hasPrefix("- ") || t.hasPrefix("* ") || t.hasPrefix("• ") {
+            flush(); blocks.append(.bullet(String(t.dropFirst(2)))); i += 1; continue
+        }
+        if let dot = t.firstIndex(of: ".") {
+            let afterDot = t.index(after: dot)
+            if let num = Int(String(t[t.startIndex..<dot])), afterDot < t.endIndex, t[afterDot] == " " {
+                flush()
+                let start = t.index(after: afterDot)
+                blocks.append(.numbered(num, start < t.endIndex ? String(t[start...]) : ""))
+                i += 1; continue
+            }
+        }
+        if t.isEmpty { flush(); i += 1; continue }
+        para.append(line)
+        i += 1
+    }
+    flush()
+    return blocks
+}
+
+func mdInline(_ s: String) -> Text {
+    let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+    if let a = try? AttributedString(markdown: s, options: opts) { return Text(a) }
+    return Text(s)
+}
+
+func highlightedCode(_ code: String) -> Text {
+    let keywords: Set<String> = ["func","let","var","if","else","for","while","return","struct","class","enum","import","guard","switch","case","break","continue","true","false","nil","self","init","private","public","static","try","catch","throw","throws","async","await","in","where","default","do","extension","protocol","typealias","defer","some","any","const","def","elif","lambda","None","True","False","and","or","not","from","as","with","yield","function","new","this","typeof","void","int","float","double","bool","string","package","using","namespace","template","auto","null","undefined","print","println"]
+    var result = Text("")
+    var idx = code.startIndex
+    while idx < code.endIndex {
+        let ch = code[idx]
+        if ch == "\"" || ch == "'" || ch == "`" {
+            let quote = ch
+            var j = code.index(after: idx)
+            var s = String(ch)
+            while j < code.endIndex {
+                let c = code[j]; s.append(c)
+                j = code.index(after: j)
+                if c == "\n" { break }
+                if c == quote { break }
+            }
+            result = result + Text(s).foregroundColor(.green)
+            idx = j; continue
+        }
+        if ch == "/" {
+            let nxt = code.index(after: idx)
+            if nxt < code.endIndex && code[nxt] == "/" {
+                var j = idx; var s = ""
+                while j < code.endIndex && code[j] != "\n" { s.append(code[j]); j = code.index(after: j) }
+                result = result + Text(s).foregroundColor(.gray)
+                idx = j; continue
+            }
+        }
+        if ch.isNumber {
+            var j = idx; var s = ""
+            while j < code.endIndex && (code[j].isNumber || code[j] == ".") { s.append(code[j]); j = code.index(after: j) }
+            result = result + Text(s).foregroundColor(.orange)
+            idx = j; continue
+        }
+        if ch.isLetter || ch == "_" {
+            var j = idx; var s = ""
+            while j < code.endIndex && (code[j].isLetter || code[j].isNumber || code[j] == "_") { s.append(code[j]); j = code.index(after: j) }
+            if keywords.contains(s) { result = result + Text(s).foregroundColor(.purple) }
+            else { result = result + Text(s) }
+            idx = j; continue
+        }
+        result = result + Text(String(ch))
+        idx = code.index(after: idx)
+    }
+    return result
+}
+
+struct CodeBlockView: View {
+    let code: String
+    let lang: String
+    var fontSize: Double
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(lang.isEmpty ? "code" : lang).font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                Button { UIPasteboard.general.string = code } label: {
+                    Label("复制", systemImage: "doc.on.doc").font(.caption2)
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Color.black.opacity(0.22))
+            ScrollView(.horizontal, showsIndicators: false) {
+                highlightedCode(code)
+                    .font(.system(size: CGFloat(max(11, fontSize - 2)), design: .monospaced))
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(10)
+            }
+        }
+        .background(Color(UIColor.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+struct MarkdownView: View {
+    let text: String
+    var fontSize: Double = 16
+    var body: some View {
+        let blocks = parseMarkdownBlocks(text)
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { item in
+                blockView(item.element)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func blockView(_ b: MDBlock) -> some View {
+        switch b {
+        case .paragraph(let s):
+            mdInline(s)
+                .font(.system(size: CGFloat(fontSize)))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        case .heading(let lvl, let s):
+            mdInline(s)
+                .font(.system(size: CGFloat(fontSize) + CGFloat(8 - min(lvl, 3) * 2), weight: .bold))
+                .fixedSize(horizontal: false, vertical: true)
+        case .bullet(let s):
+            HStack(alignment: .top, spacing: 6) {
+                Text("•").font(.system(size: CGFloat(fontSize)))
+                mdInline(s).font(.system(size: CGFloat(fontSize))).textSelection(.enabled)
+            }
+        case .numbered(let n, let s):
+            HStack(alignment: .top, spacing: 6) {
+                Text("\(n).").font(.system(size: CGFloat(fontSize)))
+                mdInline(s).font(.system(size: CGFloat(fontSize))).textSelection(.enabled)
+            }
+        case .code(let lang, let body):
+            CodeBlockView(code: body, lang: lang, fontSize: fontSize)
+        }
+    }
+}
+
 // MARK: - 单条消息
 struct MessageRow: View {
     let message: ChatMessage
@@ -1600,13 +1783,11 @@ struct MessageRow: View {
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
                 ForEach(message.attachments) { att in AttachmentChip(att: att) }
                 if !message.content.isEmpty {
-                    Text(message.content)
-                        .font(.system(size: CGFloat(fontSize)))
+                    MarkdownView(text: message.content, fontSize: fontSize)
                         .padding(.horizontal, 12).padding(.vertical, 9)
                         .background(isUser ? Color.accentColor.opacity(0.22) : Color(UIColor.secondarySystemBackground))
                         .foregroundColor(.primary)
                         .clipShape(RoundedRectangle(cornerRadius: 16))
-                        .textSelection(.enabled)
                 } else if message.attachments.isEmpty {
                     HStack(spacing: 6) { ProgressView(); Text("思考中…").font(.footnote).foregroundColor(.secondary) }
                         .padding(10).background(Color(UIColor.secondarySystemBackground))
