@@ -987,8 +987,34 @@ final class ChatStore: ObservableObject {
     }
 
     func applyContextLimit(_ msgs: [ChatMessage]) -> [ChatMessage] {
-        if contextLimit <= 0 || msgs.count <= contextLimit { return msgs }
-        return Array(msgs.suffix(contextLimit))
+        var arr = msgs
+        if contextLimit > 0 && arr.count > contextLimit { arr = Array(arr.suffix(contextLimit)) }
+        // 按总字符数再限一层，避免历史里旧长消息撑爆 token
+        let maxTotal = 40000
+        var total = 0
+        var kept: [ChatMessage] = []
+        for m in arr.reversed() {
+            total += m.content.count
+            if total > maxTotal && !kept.isEmpty { break }
+            kept.append(m)
+        }
+        return kept.reversed()
+    }
+
+    // 导处后的会话清洗：单条消息过长时截断，防止界面卡顿/发送超限
+    private func sanitize(_ convs: [Conversation]) -> [Conversation] {
+        let perMsgMax = 20000
+        return convs.map { c in
+            var conv = c
+            conv.messages = c.messages.map { m in
+                var msg = m
+                if msg.content.count > perMsgMax {
+                    msg.content = String(msg.content.prefix(perMsgMax)) + "\n…（导入时已截断）"
+                }
+                return msg
+            }
+            return conv
+        }
     }
 
     var currentMode: ChatMode {
@@ -1452,10 +1478,9 @@ final class ChatStore: ObservableObject {
     @discardableResult
     func importConversations(from url: URL) -> Int {
         guard let data = FileClassifier.readData(url) else { return -1 }
-        let convs = ConversationImporter.parse(data, filename: url.lastPathComponent)
+        let convs = sanitize(ConversationImporter.parse(data, filename: url.lastPathComponent))
         guard !convs.isEmpty else { return 0 }
         conversations.insert(contentsOf: convs, at: 0)
-        if let f = convs.first { currentID = f.id }
         persist()
         return convs.count
     }
@@ -1468,10 +1493,9 @@ final class ChatStore: ObservableObject {
             return (true, ConversationImporter.parse(data, filename: name))
         }.value
         guard result.read else { return -1 }
-        let convs = result.convs
+        let convs = sanitize(result.convs)
         guard !convs.isEmpty else { return 0 }
         conversations.insert(contentsOf: convs, at: 0)
-        if let f = convs.first { currentID = f.id }
         persist()
         return convs.count
     }
@@ -1533,6 +1557,11 @@ final class ChatStore: ObservableObject {
             finalText += (finalText.isEmpty ? "" : "\n\n") + "[压缩包内容]\n" + zipText
         }
         if !extraText.isEmpty { finalText += extraText }
+        // 限制总输入长度，避免超过模型 token 上限（约 32768 tokens）
+        let maxChars = 24000
+        if finalText.count > maxChars {
+            finalText = String(finalText.prefix(maxChars)) + "\n\n…（内容过长已截断，仅发送前 \(maxChars) 字；如需完整处理请分段发送）"
+        }
         if currentMode == .work && !finalText.isEmpty {
             finalText = "[工作模式] 请把任务拆成步骤逐步推进，每一步给出明确进展；全部完成时，最后单独一行输出：[完成]\n\n" + finalText
         }
@@ -2105,7 +2134,15 @@ struct ContentView: View {
                     }
 
                     Button {
-                        let t = input; let files = picked
+                        var t = input; var files = picked
+                        // 长文本（含粘贴的）自动转成 txt 文件上传（仅 DeepSeek 支持文件时）
+                        let isDS = (store.selection().0?.baseURL.lowercased().contains("deepseek") ?? false)
+                        if isDS && t.count > 8000 {
+                            let ts = Int(Date().timeIntervalSince1970)
+                            let pf = PickedFile(data: Data(t.utf8), filename: "长文本-\(ts).txt", isImage: false, purpose: "user_data", mimeType: "text/plain", isZip: false)
+                            files.append(pf)
+                            t = "（内容较长，已作为 txt 文件上传，请阅读附件后回答）"
+                        }
                         input = ""; picked = []; inputFocused = false
                         Task { await store.send(t, files: files) }
                     } label: {
@@ -2342,6 +2379,9 @@ struct ConversationListView: View {
     @State private var searchText = ""
     @State private var renamingID: UUID?
     @State private var renameText = ""
+    @State private var importing = false
+    @State private var importMsg = ""
+    @State private var importDone: String?
 
     private var filtered: [Conversation] {
         if searchText.trimmingCharacters(in: .whitespaces).isEmpty { return store.conversations }
@@ -2411,16 +2451,38 @@ struct ConversationListView: View {
                     DocumentPicker(allowsMultiple: false, contentTypes: [.data]) { urls in
                         activeConvSheet = nil
                         guard let url = urls.first else { return }
+                        importing = true
+                        importMsg = "正在导入…"
+                        importDone = nil
                         Task {
                             let n = await store.importFromURL(url)
-                            if n > 0 { dismiss() }
-                            else if n == 0 { store.errorText = "该文件没有可识别的对话" }
-                            else { store.errorText = "无法读取该文件" }
+                            await MainActor.run {
+                                importing = false
+                                if n > 0 { importDone = "已导入 \(n) 个对话，可在列表中查看" }
+                                else if n == 0 { importDone = "该文件没有可识别的对话" }
+                                else { importDone = "无法读取该文件" }
+                            }
                         }
                     }
                 case .export:
                     ActivityView(items: exportItems)
                 }
+            }
+            .overlay {
+                if importing {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(importMsg).font(.footnote).foregroundColor(.secondary)
+                    }
+                    .padding(24)
+                    .background(.ultraThinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                }
+            }
+            .alert("导入", isPresented: Binding(get: { importDone != nil }, set: { if !$0 { importDone = nil } })) {
+                Button("好") { importDone = nil }
+            } message: {
+                Text(importDone ?? "")
             }
         }
     }
