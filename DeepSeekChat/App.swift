@@ -1134,6 +1134,21 @@ final class ChatStore: ObservableObject {
         return content
     }
 
+    func regenerateFrom(_ messageID: UUID) async {
+        guard !isSending, let i = currentIndex else { return }
+        var conv = conversations[i]
+        guard let idx = conv.messages.firstIndex(where: { $0.id == messageID }) else { return }
+        var userIdx: Int? = nil
+        var k = idx
+        while k >= 0 { if conv.messages[k].role == .user { userIdx = k; break }; k -= 1 }
+        guard let ui = userIdx else { return }
+        let userText = conv.messages[ui].content
+        conv.messages = Array(conv.messages.prefix(ui))
+        conversations[i] = conv
+        persist()
+        await send(userText, files: [])
+    }
+
     func regenerate() async {
         guard !isSending, let i = currentIndex else { return }
         var conv = conversations[i]
@@ -1920,6 +1935,7 @@ enum MDBlock {
     case code(lang: String, body: String)
     case bullet(String)
     case numbered(Int, String)
+    case table(header: [String], rows: [[String]])
 }
 
 func parseMarkdownBlocks(_ text: String) -> [MDBlock] {
@@ -1945,6 +1961,27 @@ func parseMarkdownBlocks(_ text: String) -> [MDBlock] {
             }
             if i < lines.count { i += 1 }
             blocks.append(.code(lang: lang, body: body.joined(separator: "\n")))
+            continue
+        }
+        if t.hasPrefix("|") && t.contains("|") {
+            flush()
+            var tableLines: [String] = []
+            while i < lines.count {
+                let tt = lines[i].trimmingCharacters(in: .whitespaces)
+                if tt.hasPrefix("|") && tt.contains("|") { tableLines.append(tt); i += 1 } else { break }
+            }
+            var rows: [[String]] = []
+            for tl in tableLines {
+                var s = tl
+                if s.hasPrefix("|") { s = String(s.dropFirst()) }
+                if s.hasSuffix("|") { s = String(s.dropLast()) }
+                let cells = s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+                if cells.allSatisfy({ $0.isEmpty || $0.allSatisfy({ ch in ch == "-" || ch == ":" }) }) { continue }
+                rows.append(cells)
+            }
+            if let head = rows.first {
+                blocks.append(.table(header: head, rows: Array(rows.dropFirst())))
+            }
             continue
         }
         if t.hasPrefix("#") {
@@ -2101,6 +2138,30 @@ struct MarkdownView: View {
             }
         case .code(let lang, let body):
             CodeBlockView(code: body, lang: lang, fontSize: fontSize)
+        case .table(let header, let rows):
+            ScrollView(.horizontal, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 0) {
+                        ForEach(header.indices, id: \.self) { j in
+                            Text(header[j]).font(.system(size: CGFloat(fontSize - 2), weight: .bold))
+                                .frame(minWidth: 70, alignment: .leading)
+                                .padding(.vertical, 6).padding(.horizontal, 8)
+                        }
+                    }
+                    .background(Color.accentColor.opacity(0.15))
+                    ForEach(rows.indices, id: \.self) { r in
+                        HStack(spacing: 0) {
+                            ForEach(rows[r].indices, id: \.self) { j in
+                                Text(rows[r][j]).font(.system(size: CGFloat(fontSize - 2)))
+                                    .frame(minWidth: 70, alignment: .leading)
+                                    .padding(.vertical, 5).padding(.horizontal, 8)
+                            }
+                        }
+                        .background(r % 2 == 0 ? Color.clear : Color.gray.opacity(0.08))
+                    }
+                }
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.25)))
+            }
         }
     }
 }
@@ -2157,21 +2218,35 @@ struct ContentView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
                             ForEach(store.messages) { m in
-                                MessageRow(message: m, fontSize: store.fontSize).id(m.id)
-                                    .contextMenu {
+                                VStack(alignment: m.role == .user ? .trailing : .leading, spacing: 4) {
+                                    MessageRow(message: m, fontSize: store.fontSize).id(m.id)
+                                        .contextMenu {
+                                            Button { UIPasteboard.general.string = m.content } label: { Label("复制", systemImage: "doc.on.doc") }
+                                            if m.role == .assistant {
+                                                Button { Task { await store.regenerateFrom(m.id) } } label: { Label("重新生成", systemImage: "arrow.clockwise") }
+                                                Button { SpeechManager.shared.speak(m.content) } label: { Label("朗读", systemImage: "speaker.wave.2") }
+                                                Button { SpeechManager.shared.stop() } label: { Label("停止朗读", systemImage: "speaker.slash") }
+                                            }
+                                            if m.role == .user {
+                                                Button {
+                                                    input = store.truncateFrom(m.id)
+                                                    inputFocused = true
+                                                } label: { Label("编辑并重新发送", systemImage: "pencil") }
+                                            }
+                                        }
+                                    HStack(spacing: 14) {
                                         Button { UIPasteboard.general.string = m.content } label: { Label("复制", systemImage: "doc.on.doc") }
                                         if m.role == .assistant {
-                                            Button { Task { await store.regenerate() } } label: { Label("重新生成", systemImage: "arrow.clockwise") }
+                                            Button { sendTask = Task { await store.regenerateFrom(m.id) } } label: { Label("重新生成", systemImage: "arrow.clockwise") }
                                             Button { SpeechManager.shared.speak(m.content) } label: { Label("朗读", systemImage: "speaker.wave.2") }
-                                            Button { SpeechManager.shared.stop() } label: { Label("停止朗读", systemImage: "speaker.slash") }
-                                        }
-                                        if m.role == .user {
-                                            Button {
-                                                input = store.truncateFrom(m.id)
-                                                inputFocused = true
-                                            } label: { Label("编辑并重新发送", systemImage: "pencil") }
+                                        } else {
+                                            Button { input = store.truncateFrom(m.id); inputFocused = true } label: { Label("编辑", systemImage: "pencil") }
                                         }
                                     }
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: m.role == .user ? .trailing : .leading)
                             }
                             if let s = store.statusText { Text(s).font(.footnote).foregroundColor(.secondary) }
                         }
