@@ -135,6 +135,14 @@ enum FileClassifier {
                           purpose: "user_data", mimeType: "image/jpeg", isZip: false)
     }
 
+    static func isTextFile(_ name: String) -> Bool {
+        let ext = (name.lowercased() as NSString).pathExtension
+        let textExts: Set<String> = ["txt","md","markdown","csv","tsv","json","xml","html","htm","yml","yaml",
+            "swift","py","js","ts","jsx","tsx","c","h","cpp","hpp","java","go","rs","rb","php",
+            "sh","bash","log","ini","toml","sql","r","m","tex","cfg","conf","gradle","properties","plist"]
+        return textExts.contains(ext)
+    }
+
     static func base64Image(from data: Data, maxSide: CGFloat = 1024) -> String? {
         guard let ui = UIImage(data: data) else { return nil }
         let ratio = min(1, maxSide / max(ui.size.width, ui.size.height))
@@ -1500,6 +1508,38 @@ final class ChatStore: ObservableObject {
         return convs.count
     }
 
+    // 将长文本按块顺序读出（每块均发给模型），汇总后回答
+    private func chunkSend(question: String, document: String, client: ChatClient, assistantIndex: Int) async throws {
+        let size = 2800
+        var chunks: [String] = []
+        var i = document.startIndex
+        while i < document.endIndex {
+            let end = document.index(i, offsetBy: size, limitedBy: document.endIndex) ?? document.endIndex
+            chunks.append(String(document[i..<end]))
+            i = end
+        }
+        let total = chunks.count
+        var notes = ""
+        for (idx, chunk) in chunks.enumerated() {
+            if !isSending { return }
+            statusText = "正在通读全文 \(idx + 1)/\(total)…"
+            let p = "这是文档第 \(idx + 1)/\(total) 块，请提炼与“\(question)”相关的要点（若无关就简述本块内容），尽量简洁：\n\n" + chunk
+            let msgs = [ChatMessage(role: .user, content: p, attachments: [])]
+            var acc = ""
+            for try await ev in client.stream(messages: msgs) {
+                if case .text(let t) = ev { acc = t }
+            }
+            notes += "\n【第\(idx + 1)块】" + acc
+            if notes.count > 14000 { notes = String(notes.suffix(12000)) }
+        }
+        statusText = "正在汇总答案…"
+        let finalPrompt = "下面是整份文档分块通读后的全部要点，请基于这些完整信息回答问题：\(question)\n" + notes
+        setContent(assistantIndex, "")
+        for try await ev in client.stream(messages: [ChatMessage(role: .user, content: finalPrompt, attachments: [])]) {
+            if case .text(let t) = ev { setContent(assistantIndex, t) }
+        }
+    }
+
     // MARK: 发送
     func send(_ text: String, files: [PickedFile]) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1528,17 +1568,31 @@ final class ChatStore: ObservableObject {
                 zipText += t.isEmpty ? "\n--- \(f.filename)：未找到可读文本 ---\n" : t
             }
             for f in nonZip {
+                let textLike = FileClassifier.isTextFile(f.filename)
                 if isDeepSeek {
-                    statusText = "正在上传 \(f.filename)…"
-                    let fid = try await client.uploadFile(f)
-                    let thumb = f.isImage ? FileClassifier.thumbnail(from: f.data) : nil
-                    meta.append(MessageAttachment(filename: f.filename, isImage: f.isImage, fileId: fid, thumbBase64: thumb))
+                    if f.isImage {
+                        statusText = "正在上传 \(f.filename)…"
+                        let fid = try await client.uploadFile(f)
+                        let thumb = FileClassifier.thumbnail(from: f.data)
+                        meta.append(MessageAttachment(filename: f.filename, isImage: true, fileId: fid, thumbBase64: thumb))
+                    } else if textLike {
+                        // 文本类文件本地读取（不截断，交由分块逻辑通读全文）
+                        if let s = String(data: f.data, encoding: .utf8) {
+                            extraText += "\n\n--- \(f.filename) ---\n" + s
+                        }
+                    } else if f.data.count > 6_000_000 {
+                        extraText += "\n\n（文件 \(f.filename) 过大（约 \(f.data.count / 1_000_000)MB），已跳过；请拆分后再发）"
+                    } else {
+                        statusText = "正在上传 \(f.filename)…"
+                        let fid = try await client.uploadFile(f)
+                        meta.append(MessageAttachment(filename: f.filename, isImage: false, fileId: fid, thumbBase64: nil))
+                    }
                 } else if f.isImage {
                     let b64 = FileClassifier.base64Image(from: f.data)
                     let thumb = FileClassifier.thumbnail(from: f.data)
                     meta.append(MessageAttachment(filename: f.filename, isImage: true, fileId: nil, thumbBase64: thumb, imageDataBase64: b64))
                 } else if let s = String(data: f.data, encoding: .utf8) {
-                    extraText += "\n\n--- \(f.filename) ---\n" + String(s.prefix(20000))
+                    extraText += "\n\n--- \(f.filename) ---\n" + String(s.prefix(12000))
                 } else {
                     extraText += "\n\n（已跳过二进制文件：\(f.filename)）"
                 }
@@ -1557,10 +1611,24 @@ final class ChatStore: ObservableObject {
             finalText += (finalText.isEmpty ? "" : "\n\n") + "[压缩包内容]\n" + zipText
         }
         if !extraText.isEmpty { finalText += extraText }
-        // 限制总输入长度，避免超过模型 token 上限（约 32768 tokens）
-        let maxChars = 24000
-        if finalText.count > maxChars {
-            finalText = String(finalText.prefix(maxChars)) + "\n\n…（内容过长已截断，仅发送前 \(maxChars) 字；如需完整处理请分段发送）"
+        // 文本过长：客户端分块通读全文（确保模型读到完整文件），不截断
+        let chunkThreshold = 14000
+        if finalText.count > chunkThreshold {
+            let question = trimmed.isEmpty ? "请总结这份文档的全部要点" : trimmed
+            let docText = finalText
+            appendToCurrent(ChatMessage(role: .user, content: "【长文档】\(question)", attachments: meta))
+            let aIdx = messages.count
+            appendToCurrent(ChatMessage(role: .assistant, content: "", attachments: []))
+            do {
+                try await chunkSend(question: question, document: docText, client: client, assistantIndex: aIdx)
+            } catch {
+                let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
+                setContent(aIdx, "⚠️ " + msg)
+            }
+            statusText = nil
+            isSending = false
+            persist()
+            return
         }
         if currentMode == .work && !finalText.isEmpty {
             finalText = "[工作模式] 请把任务拆成步骤逐步推进，每一步给出明确进展；全部完成时，最后单独一行输出：[完成]\n\n" + finalText
@@ -2141,7 +2209,7 @@ struct ContentView: View {
                             let ts = Int(Date().timeIntervalSince1970)
                             let pf = PickedFile(data: Data(t.utf8), filename: "长文本-\(ts).txt", isImage: false, purpose: "user_data", mimeType: "text/plain", isZip: false)
                             files.append(pf)
-                            t = "（内容较长，已作为 txt 文件上传，请阅读附件后回答）"
+                            t = "请阅读附件并回答（内容较长，将分块通读全文）"
                         }
                         input = ""; picked = []; inputFocused = false
                         Task { await store.send(t, files: files) }
