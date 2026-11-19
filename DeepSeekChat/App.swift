@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 import Compression
 import AVFoundation
 import Speech
+import PDFKit
 
 // MARK: - 数据模型
 struct PickedFile: Identifiable {
@@ -37,6 +38,7 @@ struct ChatMessage: Identifiable, Codable {
 }
 
 enum ChatMode: String, Codable { case chat, work }
+enum LongDocMode { case full, important }
 
 struct Conversation: Identifiable, Codable {
     var id = UUID()
@@ -141,6 +143,42 @@ enum FileClassifier {
             "swift","py","js","ts","jsx","tsx","c","h","cpp","hpp","java","go","rs","rb","php",
             "sh","bash","log","ini","toml","sql","r","m","tex","cfg","conf","gradle","properties","plist"]
         return textExts.contains(ext)
+    }
+
+    // 本地抽取文档文字（PDF / docx / pptx / xlsx），避免服务端整篇解析导致超长
+    static func documentText(_ f: PickedFile) -> String? {
+        let ext = (f.filename.lowercased() as NSString).pathExtension
+        if isTextFile(f.filename) { return String(data: f.data, encoding: .utf8) }
+        if ext == "pdf" {
+            guard let doc = PDFDocument(data: f.data) else { return nil }
+            var s = ""
+            for i in 0..<doc.pageCount {
+                if let p = doc.page(at: i)?.string { s += p + "\n" }
+            }
+            return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : s
+        }
+        if ["docx", "pptx", "xlsx"].contains(ext) {
+            let entries = ZipReader.extractFiles(from: f.data, onlyExtensions: ["xml"])
+            var s = ""
+            for (name, d) in entries {
+                let low = name.lowercased()
+                if low.contains("document") || low.contains("slide") || low.contains("sheet") || low.contains("sharedstrings") {
+                    if let t = String(data: d, encoding: .utf8) { s += stripXML(t) + "\n" }
+                }
+            }
+            return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : s
+        }
+        return nil
+    }
+
+    static func stripXML(_ x: String) -> String {
+        var out = ""; var inTag = false
+        for ch in x {
+            if ch == "<" { inTag = true }
+            else if ch == ">" { inTag = false; out.append(" ") }
+            else if !inTag { out.append(ch) }
+        }
+        return out
     }
 
     static func base64Image(from data: Data, maxSide: CGFloat = 1024) -> String? {
@@ -1510,7 +1548,7 @@ final class ChatStore: ObservableObject {
 
     // 将长文本按块顺序读出（每块均发给模型），汇总后回答
     private func chunkSend(question: String, document: String, client: ChatClient, assistantIndex: Int) async throws {
-        let size = 2800
+        let size = 6000
         var chunks: [String] = []
         var i = document.startIndex
         while i < document.endIndex {
@@ -1522,7 +1560,7 @@ final class ChatStore: ObservableObject {
         var notes = ""
         for (idx, chunk) in chunks.enumerated() {
             if !isSending { return }
-            statusText = "正在通读全文 \(idx + 1)/\(total)…"
+            statusText = "正在通读全文 \(idx + 1)/\(total)（可点红色停止）…"
             let p = "这是文档第 \(idx + 1)/\(total) 块，请提炼与“\(question)”相关的要点（若无关就简述本块内容），尽量简洁：\n\n" + chunk
             let msgs = [ChatMessage(role: .user, content: p, attachments: [])]
             var acc = ""
@@ -1540,8 +1578,46 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    // 重要理解：只抽取与问题最相关的片段（省 token）
+    private func importantSend(question: String, document: String, client: ChatClient, assistantIndex: Int) async throws {
+        let size = 2000
+        var chunks: [String] = []
+        var i = document.startIndex
+        while i < document.endIndex {
+            let end = document.index(i, offsetBy: size, limitedBy: document.endIndex) ?? document.endIndex
+            chunks.append(String(document[i..<end]))
+            i = end
+        }
+        var qfreq: [Character: Int] = [:]
+        for ch in question where ch.isLetter || ch.isNumber { qfreq[ch, default: 0] += 1 }
+        func score(_ s: String) -> Int {
+            var n = 0
+            for ch in s where ch.isLetter || ch.isNumber { if let c = qfreq[ch] { n += c } }
+            return n
+        }
+        let scored = chunks.enumerated().map { (idx: $0.offset, text: $0.element, sc: score($0.element)) }
+        let sorted = scored.sorted { $0.sc > $1.sc }
+        var chosen: [Int] = []
+        var budget = 12000
+        for it in sorted {
+            if budget <= 0 { break }
+            if it.sc == 0 && !chosen.isEmpty { continue }
+            chosen.append(it.idx)
+            budget -= it.text.count
+        }
+        chosen.sort()
+        var ctx = ""
+        for idx in chosen { ctx += "\n\n【片段\(idx + 1)】\n" + chunks[idx] }
+        statusText = "正在理解关键部分…"
+        let p = "以下是文档中与问题最相关的部分（已节选，非全文），请据此回答：\(question)\n" + ctx
+        setContent(assistantIndex, "")
+        for try await ev in client.stream(messages: [ChatMessage(role: .user, content: p, attachments: [])]) {
+            if case .text(let t) = ev { setContent(assistantIndex, t) }
+        }
+    }
+
     // MARK: 发送
-    func send(_ text: String, files: [PickedFile]) async {
+    func send(_ text: String, files: [PickedFile], longDoc: LongDocMode = .important) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !files.isEmpty else { return }
         guard !isSending else { return }
@@ -1568,31 +1644,28 @@ final class ChatStore: ObservableObject {
                 zipText += t.isEmpty ? "\n--- \(f.filename)：未找到可读文本 ---\n" : t
             }
             for f in nonZip {
-                let textLike = FileClassifier.isTextFile(f.filename)
-                if isDeepSeek {
-                    if f.isImage {
+                if f.isImage {
+                    if isDeepSeek {
                         statusText = "正在上传 \(f.filename)…"
                         let fid = try await client.uploadFile(f)
                         let thumb = FileClassifier.thumbnail(from: f.data)
                         meta.append(MessageAttachment(filename: f.filename, isImage: true, fileId: fid, thumbBase64: thumb))
-                    } else if textLike {
-                        // 文本类文件本地读取（不截断，交由分块逻辑通读全文）
-                        if let s = String(data: f.data, encoding: .utf8) {
-                            extraText += "\n\n--- \(f.filename) ---\n" + s
-                        }
-                    } else if f.data.count > 6_000_000 {
-                        extraText += "\n\n（文件 \(f.filename) 过大（约 \(f.data.count / 1_000_000)MB），已跳过；请拆分后再发）"
                     } else {
-                        statusText = "正在上传 \(f.filename)…"
-                        let fid = try await client.uploadFile(f)
-                        meta.append(MessageAttachment(filename: f.filename, isImage: false, fileId: fid, thumbBase64: nil))
+                        let b64 = FileClassifier.base64Image(from: f.data)
+                        let thumb = FileClassifier.thumbnail(from: f.data)
+                        meta.append(MessageAttachment(filename: f.filename, isImage: true, fileId: nil, thumbBase64: thumb, imageDataBase64: b64))
                     }
-                } else if f.isImage {
-                    let b64 = FileClassifier.base64Image(from: f.data)
-                    let thumb = FileClassifier.thumbnail(from: f.data)
-                    meta.append(MessageAttachment(filename: f.filename, isImage: true, fileId: nil, thumbBase64: thumb, imageDataBase64: b64))
+                } else if let docText = FileClassifier.documentText(f) {
+                    // PDF/Word/PPT/文本：本地抽文字，交分块通读（不交服务端整篇解析）
+                    extraText += "\n\n--- \(f.filename) ---\n" + docText
+                } else if f.data.count > 6_000_000 {
+                    extraText += "\n\n（文件 \(f.filename) 过大，已跳过；请拆分后再发）"
+                } else if isDeepSeek {
+                    statusText = "正在上传 \(f.filename)…"
+                    let fid = try await client.uploadFile(f)
+                    meta.append(MessageAttachment(filename: f.filename, isImage: false, fileId: fid, thumbBase64: nil))
                 } else if let s = String(data: f.data, encoding: .utf8) {
-                    extraText += "\n\n--- \(f.filename) ---\n" + String(s.prefix(12000))
+                    extraText += "\n\n--- \(f.filename) ---\n" + s
                 } else {
                     extraText += "\n\n（已跳过二进制文件：\(f.filename)）"
                 }
@@ -1616,11 +1689,16 @@ final class ChatStore: ObservableObject {
         if finalText.count > chunkThreshold {
             let question = trimmed.isEmpty ? "请总结这份文档的全部要点" : trimmed
             let docText = finalText
-            appendToCurrent(ChatMessage(role: .user, content: "【长文档】\(question)", attachments: meta))
+            let tag = longDoc == .full ? "【长文档·全部理解】" : "【长文档·重要理解】"
+            appendToCurrent(ChatMessage(role: .user, content: tag + question, attachments: meta))
             let aIdx = messages.count
             appendToCurrent(ChatMessage(role: .assistant, content: "", attachments: []))
             do {
-                try await chunkSend(question: question, document: docText, client: client, assistantIndex: aIdx)
+                if longDoc == .full {
+                    try await chunkSend(question: question, document: docText, client: client, assistantIndex: aIdx)
+                } else {
+                    try await importantSend(question: question, document: docText, client: client, assistantIndex: aIdx)
+                }
             } catch {
                 let msg = (error as? ChatRequestError)?.message ?? error.localizedDescription
                 setContent(aIdx, "⚠️ " + msg)
@@ -2065,6 +2143,11 @@ struct ContentView: View {
     @State private var showPhotos = false
     @State private var exportItems: [Any] = []
     @FocusState private var inputFocused: Bool
+    @State private var sendTask: Task<Void, Never>?
+    @State private var showConfirm = false
+    @State private var confirmT = ""
+    @State private var confirmF: [PickedFile] = []
+    @State private var confirmEst = 0
     private let presets = ["翻译成英文", "润色文字", "总结要点", "写代码", "解释代码", "列大纲"]
 
     var body: some View {
@@ -2201,23 +2284,36 @@ struct ContentView: View {
                             .foregroundColor(speech.isRecording ? .red : .secondary)
                     }
 
-                    Button {
-                        var t = input; var files = picked
-                        // 长文本（含粘贴的）自动转成 txt 文件上传（仅 DeepSeek 支持文件时）
-                        let isDS = (store.selection().0?.baseURL.lowercased().contains("deepseek") ?? false)
-                        if isDS && t.count > 8000 {
-                            let ts = Int(Date().timeIntervalSince1970)
-                            let pf = PickedFile(data: Data(t.utf8), filename: "长文本-\(ts).txt", isImage: false, purpose: "user_data", mimeType: "text/plain", isZip: false)
-                            files.append(pf)
-                            t = "请阅读附件并回答（内容较长，将分块通读全文）"
+                    if store.isSending {
+                        Button {
+                            sendTask?.cancel()
+                            store.isSending = false
+                            store.statusText = nil
+                        } label: {
+                            Image(systemName: "stop.circle.fill").font(.system(size: 30)).foregroundColor(.red)
                         }
-                        input = ""; picked = []; inputFocused = false
-                        Task { await store.send(t, files: files) }
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
-                            .foregroundColor(canSend ? .accentColor : .gray)
+                    } else {
+                        Button {
+                            var t = input; var files = picked
+                            let isDS = (store.selection().0?.baseURL.lowercased().contains("deepseek") ?? false)
+                            if isDS && t.count > 8000 {
+                                let ts = Int(Date().timeIntervalSince1970)
+                                let pf = PickedFile(data: Data(t.utf8), filename: "长文本-\(ts).txt", isImage: false, purpose: "user_data", mimeType: "text/plain", isZip: false)
+                                files.append(pf)
+                                t = "请阅读附件并回答（内容较长，将分块通读全文）"
+                            }
+                            let est = t.count + files.reduce(0) { $0 + ($1.isImage ? 0 : $1.data.count) }
+                            if est > 20000 || t.count > 14000 {
+                                confirmT = t; confirmF = files; confirmEst = est; showConfirm = true
+                            } else {
+                                doSend(t, files, .important)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
+                                .foregroundColor(canSend ? .accentColor : .gray)
+                        }
+                        .disabled(!canSend)
                     }
-                    .disabled(!canSend)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
                 .background(Color(UIColor.systemBackground))
@@ -2225,6 +2321,13 @@ struct ContentView: View {
             .navigationTitle(store.currentTitle)
             .navigationBarTitleDisplayMode(.inline)
             .preferredColorScheme(store.colorScheme)
+            .confirmationDialog("内容较大，选择理解方式", isPresented: $showConfirm, titleVisibility: .visible) {
+                Button("全部理解（读完整个文件，较贵）") { doSend(confirmT, confirmF, .full) }
+                Button("重要理解（只抽取相关部分，省 token）") { doSend(confirmT, confirmF, .important) }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("约 \(max(1, confirmEst / 1000))K 字符。全部理解=分块通读全文；重要理解=只挑与问题相关的片段。发送后可点红色停止按钮中断。")
+            }
             .onChange(of: speech.transcript) { v in if !v.isEmpty { input = v } }
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarLeading) {
@@ -2276,6 +2379,11 @@ struct ContentView: View {
 
     private var canSend: Bool {
         !store.isSending && (!input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !picked.isEmpty)
+    }
+
+    private func doSend(_ t: String, _ files: [PickedFile], _ mode: LongDocMode = .important) {
+        input = ""; picked = []; inputFocused = false
+        sendTask = Task { await store.send(t, files: files, longDoc: mode) }
     }
 
     private func exportCurrent(_ ext: String) {
