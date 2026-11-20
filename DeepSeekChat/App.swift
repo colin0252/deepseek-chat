@@ -2064,42 +2064,51 @@ struct CodeBlockView: View {
     let code: String
     let lang: String
     var fontSize: Double
+    @State private var copied = false
+    @State private var rendered: AttributedString? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(lang.isEmpty ? "code" : lang).font(.caption2).foregroundColor(.secondary)
                 Spacer()
-                Button { UIPasteboard.general.string = code } label: {
-                    Label("复制", systemImage: "doc.on.doc").font(.caption2)
+                Button {
+                    UIPasteboard.general.string = code
+                    copied = true
+                } label: {
+                    Label(copied ? "已复制" : "复制全部", systemImage: copied ? "checkmark" : "doc.on.doc").font(.caption2)
                 }
                 .buttonStyle(.borderless)
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(Color.black.opacity(0.22))
-            ScrollView(.horizontal, showsIndicators: false) {
-                Group {
-                    if code.count > 20000 {
-                        Text(code)
-                    } else {
-                        Text(highlightedCode(code))
-                    }
-                }
-                .font(.system(size: CGFloat(max(11, fontSize - 2)), design: .monospaced))
-                .foregroundColor(.primary)
-                .fixedSize(horizontal: true, vertical: false)
-                .padding(10)
+            ScrollView(.horizontal, showsIndicators: true) {
+                Text(rendered ?? AttributedString(code))
+                    .font(.system(size: CGFloat(max(11, fontSize - 2)), design: .monospaced))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(10)
             }
         }
         .background(Color(UIColor.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .task(id: code) {
+            rendered = code.count > 30000 ? AttributedString(code) : highlightedCode(code)
+        }
     }
 }
 
 struct MarkdownView: View {
     let text: String
     var fontSize: Double = 16
+    var streaming: Bool = false
     var body: some View {
-        if text.count > 60000 {
+        if streaming {
+            Text(text)
+                .font(.system(size: CGFloat(fontSize)))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if text.count > 60000 {
             Text(String(text.prefix(60000)) + "\n…（内容过长，已截断显示，可长按复制全部）")
                 .font(.system(size: CGFloat(fontSize)))
                 .textSelection(.enabled)
@@ -2170,6 +2179,7 @@ struct MarkdownView: View {
 struct MessageRow: View {
     let message: ChatMessage
     var fontSize: Double = 16
+    var streaming: Bool = false
     var body: some View {
         let isUser = message.role == .user
         HStack(alignment: .top, spacing: 8) {
@@ -2177,7 +2187,7 @@ struct MessageRow: View {
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
                 ForEach(message.attachments) { att in AttachmentChip(att: att) }
                 if !message.content.isEmpty {
-                    MarkdownView(text: message.content, fontSize: fontSize)
+                    MarkdownView(text: message.content, fontSize: fontSize, streaming: streaming)
                         .padding(.horizontal, 12).padding(.vertical, 9)
                         .background(isUser ? Color.accentColor.opacity(0.22) : Color(UIColor.secondarySystemBackground))
                         .foregroundColor(.primary)
@@ -2219,7 +2229,7 @@ struct ContentView: View {
                         LazyVStack(alignment: .leading, spacing: 14) {
                             ForEach(store.messages) { m in
                                 VStack(alignment: m.role == .user ? .trailing : .leading, spacing: 4) {
-                                    MessageRow(message: m, fontSize: store.fontSize).id(m.id)
+                                    MessageRow(message: m, fontSize: store.fontSize, streaming: store.isSending && m.role == .assistant && m.id == store.messages.last?.id).id(m.id)
                                         .contextMenu {
                                             Button { UIPasteboard.general.string = m.content } label: { Label("复制", systemImage: "doc.on.doc") }
                                             if m.role == .assistant {
@@ -3006,6 +3016,8 @@ struct GitHubCodeView: View {
     @State private var loading = false
     @State private var status: String?
     @State private var errorText: String?
+    @State private var pendingCode: String?
+    @State private var pendingURI: String = "https://github.com/login/device"
 
     var body: some View {
         Form {
@@ -3019,6 +3031,21 @@ struct GitHubCodeView: View {
                 } else {
                     Button(loading ? "登录中…" : "使用 GitHub 登录") { login() }
                         .disabled(loading)
+                }
+                if let pc = pendingCode {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("验证码：\(pc)").font(.title3).bold()
+                        if let u = URL(string: pendingURI) {
+                            Link(destination: u) {
+                                Label("点这里打开 GitHub 授权页", systemImage: "safari")
+                            }
+                        }
+                        Button {
+                            UIPasteboard.general.string = pc
+                        } label: { Label("复制验证码", systemImage: "doc.on.doc") }
+                        Text("在打开的网页里粘贴验证码并授权，App 会自动完成登录。")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
                 }
                 Text("首次使用：GitHub → Settings → Developer settings → OAuth Apps 新建一个，勾选 Enable Device Flow，把 Client ID 填到上面。验证码会自动复制。")
                     .font(.caption2).foregroundColor(.secondary)
@@ -3057,7 +3084,9 @@ struct GitHubCodeView: View {
             let auth = GitHubAuth(clientID: cid)
             do {
                 let dc = try await auth.requestDeviceCode()
-                status = "验证码：\(dc.userCode) —— 已打开浏览器，请到 GitHub 输入并授权"
+                pendingCode = dc.userCode
+                pendingURI = dc.verificationURI
+                status = "验证码：\(dc.userCode) —— 如未自动打开浏览器，点下面「打开 GitHub 授权页」"
                 UIPasteboard.general.string = dc.userCode
                 if let url = URL(string: dc.verificationURI) { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
                 let token = try await auth.pollToken(deviceCode: dc.deviceCode, interval: dc.interval)
